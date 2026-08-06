@@ -350,7 +350,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             match self.login_email_pass(&username, &hashed_password).await {
                 Ok(LoginState::LoggedIn) => {},
                 _err => {
-                    error!("Failed to refresh tokens, state {_err:?}");
+                    error!("Failed to refresh account tokens");
                     return None
                 }
             }
@@ -775,7 +775,12 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             }).collect();
             self.tokens = keys;
         }
-        debug!("spd {:?}", decoded_spd);
+        debug!(
+            "Parsed SPD response (keys={}, has_account_name={}, has_token_dictionary={})",
+            decoded_spd.len(),
+            decoded_spd.contains_key("acname"),
+            decoded_spd.contains_key("t")
+        );
 
         self.username = Some(decoded_spd.get("acname").expect("No account name?").as_string().unwrap().to_string());
         self.spd = Some(decoded_spd);
@@ -822,8 +827,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         if !res.status().is_success() {
             let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            error!("send_2fa_to_devices failed: HTTP {} — body: {}", status, body);
+            error!("send_2fa_to_devices failed: HTTP {}", status);
             return Err(Error::AuthSrp);
         }
 
@@ -867,13 +871,16 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
         let status = req.status().as_u16();
         if status == 403 {
-            let body = req.bytes().await?;
-            warn!("Got auth response {}", base64::encode(&body));
+            warn!("Failed to retrieve GSA authentication extras (HTTP 403)");
             return Err(Error::FailedGetting2FAConfig);
         }
         let resp = req.bytes().await?;
-        info!("Got gsa auth extras {:?}", str::from_utf8(&resp).unwrap());
         let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
+        info!(
+            "Parsed GSA authentication extras (trusted_phone_count={}, has_new_state={})",
+            new_state.trusted_phone_numbers.len(),
+            new_state.new_state.is_some()
+        );
         if new_state.trusted_phone_numbers.is_empty() {
             return Err(Error::HardwareKeyError);
         }
@@ -1003,7 +1010,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if res.status() != 200 {
-            error!("Security code failed, response: {}", res.text().await?);
+            error!("SMS security-code verification failed");
             return Err(Error::Bad2faCode);
         }
 

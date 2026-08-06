@@ -45,8 +45,7 @@ mod tests {
             default_provider(info, PathBuf::from_str("anisette_test").unwrap())).await;
 
         let account = acc.unwrap();
-        println!("data {:?}", account.get_name());
-        println!("PET: {}", account.get_pet().unwrap());
+        println!("Authenticated account fixture");
         return;
     }
 }
