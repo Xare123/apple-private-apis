@@ -22,3 +22,6 @@ jobs:
         with:
           command: build
           args: --release --features '${{ matrix.features }}'
+      - name: Test remote Anisette v3
+        if: matrix.features == 'remote-anisette-v3'
+        run: cargo test -p omnisette --features remote-anisette-v3
