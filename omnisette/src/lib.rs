@@ -6,8 +6,12 @@
 
 use std::collections::HashMap;
 use std::io;
+#[cfg(any(
+    feature = "remote-anisette-v3",
+    feature = "remote-clearadi",
+    target_os = "macos"
+))]
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 #[cfg(feature = "remote-clearadi")]
@@ -107,7 +111,13 @@ pub fn default_provider(info: LoginClientInfo, path: PathBuf) -> ArcAnisetteClie
     })))
 }
 
+#[cfg(any(
+    feature = "remote-anisette-v3",
+    feature = "remote-clearadi",
+    target_os = "macos"
+))]
 #[tokio::test]
+#[ignore = "manual integration test; contacts the configured Anisette service"]
 async fn test_adi() {
     let default = default_provider(LoginClientInfo {
         ak_context_type: "imessage".to_string(),
@@ -120,8 +130,10 @@ async fn test_adi() {
         hardware_headers: HashMap::from_iter([]),
         push_token: None,
         update_account_bundle_id: "<iMac13,1> <macOS;13.6.4;22G513> <com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)>".to_string(),
-    }, PathBuf::from_str("anisette_test").expect("test"));
-    println!("headers {:?}", default.lock().await.get_headers().await.expect("No headers??"));
+    }, PathBuf::from("anisette_test"));
+    let mut client = default.lock().await;
+    let headers = client.get_headers().await.expect("Anisette headers unavailable");
+    assert!(!headers.is_empty());
 }
 
 
