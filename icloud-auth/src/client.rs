@@ -1064,10 +1064,25 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
     // pub async 
 
+    fn two_factor_identity(
+        spd: Option<&plist::Dictionary>,
+    ) -> Result<(&str, &str), crate::Error> {
+        let spd = spd.ok_or(Error::TwoFactorSessionMissing)?;
+        let dsid = spd
+            .get("adsid")
+            .and_then(plist::Value::as_string)
+            .filter(|value| !value.is_empty())
+            .ok_or(Error::TwoFactorSessionMissing)?;
+        let token = spd
+            .get("GsIdmsToken")
+            .and_then(plist::Value::as_string)
+            .filter(|value| !value.is_empty())
+            .ok_or(Error::TwoFactorSessionMissing)?;
+        Ok((dsid, token))
+    }
+
     pub async fn build_2fa_headers(&self, sms: bool) -> Result<HeaderMap, crate::Error> {
-        let spd = self.spd.as_ref().unwrap();
-        let dsid = spd.get("adsid").unwrap().as_string().unwrap();
-        let token = spd.get("GsIdmsToken").unwrap().as_string().unwrap();
+        let (dsid, token) = Self::two_factor_identity(self.spd.as_ref())?;
 
         let identity_token = base64::encode(format!("{}:{}", dsid, token));
 
@@ -1099,5 +1114,49 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
 
         Ok(headers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppleAccount;
+    use crate::Error;
+    use plist::{Dictionary, Value};
+
+    #[test]
+    fn two_factor_identity_rejects_absent_or_incomplete_spd() {
+        assert!(matches!(
+            AppleAccount::<omnisette::DefaultAnisetteProvider>::two_factor_identity(None),
+            Err(Error::TwoFactorSessionMissing)
+        ));
+
+        let mut spd = Dictionary::new();
+        spd.insert("adsid".to_string(), Value::String("account-id".to_string()));
+        assert!(matches!(
+            AppleAccount::<omnisette::DefaultAnisetteProvider>::two_factor_identity(Some(&spd)),
+            Err(Error::TwoFactorSessionMissing)
+        ));
+
+        spd.insert("GsIdmsToken".to_string(), Value::String(String::new()));
+        assert!(matches!(
+            AppleAccount::<omnisette::DefaultAnisetteProvider>::two_factor_identity(Some(&spd)),
+            Err(Error::TwoFactorSessionMissing)
+        ));
+    }
+
+    #[test]
+    fn two_factor_identity_accepts_complete_spd() {
+        let mut spd = Dictionary::new();
+        spd.insert("adsid".to_string(), Value::String("account-id".to_string()));
+        spd.insert(
+            "GsIdmsToken".to_string(),
+            Value::String("identity-token".to_string()),
+        );
+
+        assert_eq!(
+            AppleAccount::<omnisette::DefaultAnisetteProvider>::two_factor_identity(Some(&spd))
+                .expect("complete SPD should produce 2FA identity"),
+            ("account-id", "identity-token")
+        );
     }
 }

@@ -34,4 +34,6 @@ pub enum Error {
     SerdeError(#[from] serde_json::Error),
     #[error("Disable hardware authentication keys and try again!")]
     HardwareKeyError,
+    #[error("cloud_sync_2fa_session_missing")]
+    TwoFactorSessionMissing,
 }
