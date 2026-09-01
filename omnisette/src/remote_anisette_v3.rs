@@ -28,6 +28,8 @@ use crate::{AnisetteError, AnisetteProvider, LoginClientInfo};
 const APPLE_ROOT: &[u8] = include_bytes!("../../icloud-auth/src/apple_root.der");
 const MAX_PROVISION_ATTEMPTS: usize = 3;
 const PROVISION_RETRY_DELAY: Duration = Duration::from_millis(750);
+const MAX_GET_HEADERS_ATTEMPTS: usize = 3;
+const GET_HEADERS_RETRY_DELAY: Duration = Duration::from_millis(500);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -365,6 +367,21 @@ fn map_get_headers_error(message: &str) -> AnisetteError {
     }
 }
 
+fn retryable_get_headers_connect_error(is_connect: bool) -> bool {
+    is_connect
+}
+
+fn retryable_get_headers_error(error: &AnisetteError) -> bool {
+    // Only connection-establishment failures are proven to precede submission
+    // of the identifier and ADI body. Timeouts, response status, decode errors,
+    // and parsed server errors may occur after submission and must not replay.
+    matches!(
+        error,
+        AnisetteError::ReqwestError(error)
+            if retryable_get_headers_connect_error(error.is_connect())
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum StateBindingAction {
     Unchanged,
@@ -477,6 +494,7 @@ impl AnisetteClient {
             .json(&body)
             .send()
             .await?
+            .error_for_status()?
             .json::<AnisetteHeaders>()
             .await?;
         match headers {
@@ -494,6 +512,31 @@ impl AnisetteClient {
                 device_unique_identifier: state.device_id(),
             }),
         }
+    }
+
+    async fn get_headers_with_retry(
+        &self,
+        state: &AnisetteState,
+    ) -> Result<AnisetteData, AnisetteError> {
+        let mut last_error = None;
+        for attempt in 1..=MAX_GET_HEADERS_ATTEMPTS {
+            match self.get_headers(state).await {
+                Ok(headers) => return Ok(headers),
+                Err(error) if retryable_get_headers_error(&error) => {
+                    warn!(
+                        "anisette_v3 stage=get_headers result={} attempt={attempt}/{MAX_GET_HEADERS_ATTEMPTS}. State is preserved.",
+                        error_kind(&error),
+                    );
+                    last_error = Some(error);
+                    if attempt < MAX_GET_HEADERS_ATTEMPTS {
+                        sleep(GET_HEADERS_RETRY_DELAY * attempt as u32).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.expect("get_headers retry loop must record a failure"))
     }
 
     pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
@@ -846,7 +889,7 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
             client.provision(state).await?;
             plist::to_file_xml(&config_path, state)?;
         }
-        let data = match client.get_headers(&state).await {
+        let data = match client.get_headers_with_retry(&state).await {
             Ok(data) => data,
             Err(err) => {
                 if matches!(err, AnisetteError::AnisetteNotProvisioned) {
@@ -854,7 +897,7 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
                     state.endpoint = None;
                     client.provision(state).await?;
                     plist::to_file_xml(config_path, state)?;
-                    client.get_headers(&state).await?
+                    client.get_headers_with_retry(&state).await?
                 } else {
                     return Err(err);
                 }
@@ -954,6 +997,23 @@ mod tests {
         assert!(WS_CONNECT_TIMEOUT > Duration::ZERO);
         assert!(WS_READ_TIMEOUT > Duration::ZERO);
         assert!(PROVISION_OVERALL_TIMEOUT > WS_READ_TIMEOUT);
+        assert_eq!(MAX_GET_HEADERS_ATTEMPTS, 3);
+        assert!(GET_HEADERS_RETRY_DELAY > Duration::ZERO);
+    }
+
+    #[test]
+    fn get_headers_retry_policy_is_pre_submission_only() {
+        assert!(retryable_get_headers_connect_error(true));
+        assert!(!retryable_get_headers_connect_error(false));
+        assert!(!retryable_get_headers_error(
+            &AnisetteError::ProvisioningServerError("private-message-sentinel".into())
+        ));
+        assert!(!retryable_get_headers_error(
+            &AnisetteError::AnisetteNotProvisioned
+        ));
+        assert!(!retryable_get_headers_error(
+            &AnisetteError::InvalidArgument("private-message-sentinel".into())
+        ));
     }
 
     #[test]
