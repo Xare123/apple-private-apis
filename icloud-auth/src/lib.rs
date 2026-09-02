@@ -24,6 +24,8 @@ pub enum Error {
     ExtraStep(String),
     #[error("Failed to parse a plist {0}")]
     PlistError(#[from] plist::Error),
+    #[error("Unexpected Apple authentication response ({0})")]
+    UnexpectedResponse(String),
     #[error("Request failed {0}")]
     ReqwestError(#[from] reqwest::Error),
     #[error("Failed getting anisette data {0}")]

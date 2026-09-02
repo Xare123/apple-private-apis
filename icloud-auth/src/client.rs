@@ -8,7 +8,7 @@ use hmac::{Hmac, Mac};
 use omnisette::{AnisetteClient, AnisetteProvider, ArcAnisetteClient, LoginClientInfo};
 use plist::{Dictionary, Value};
 use reqwest::{
-    header::{HeaderMap, HeaderName, HeaderValue}, Certificate, Client, ClientBuilder, Proxy, Response
+    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE}, Certificate, Client, ClientBuilder, Proxy, Response
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -208,12 +208,106 @@ pub struct AuthenticationExtras {
 //     }
 // }
 
-async fn parse_response(res: Result<Response, reqwest::Error>) -> Result<plist::Dictionary, crate::Error> {
-    let res = res?.text().await?;
-    let res: plist::Dictionary = plist::from_bytes(res.as_bytes())?;
-    let res: plist::Value = res.get("Response").unwrap().to_owned();
-    match res {
-        plist::Value::Dictionary(dict) => Ok(dict),
+fn looks_like_html(value: &str) -> bool {
+    let prefix = value.trim_start().chars().take(64).collect::<String>().to_ascii_lowercase();
+    prefix.contains("<html") || prefix.contains("<!doctype html")
+}
+
+fn safe_html_title(body: &str) -> String {
+    let lowercase = body.to_ascii_lowercase();
+    let Some(title_start) = lowercase.find("<title") else { return "none".to_string() };
+    let Some(open_end) = lowercase[title_start..].find('>') else { return "malformed".to_string() };
+    let content_start = title_start + open_end + 1;
+    let Some(close_offset) = lowercase[content_start..].find("</title>") else { return "malformed".to_string() };
+    let raw = &body[content_start..content_start + close_offset];
+    if raw.contains('@') { return "[redacted]".to_string() }
+
+    let mut normalized = String::new();
+    let mut digits = String::new();
+    for character in raw.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+            continue;
+        }
+        if !digits.is_empty() {
+            if digits.len() >= 5 { normalized.push_str("[number-redacted]") } else { normalized.push_str(&digits) }
+            digits.clear();
+        }
+        if character.is_ascii_alphanumeric()
+            || matches!(character, ' ' | '-' | '_' | ':' | '.' | ',' | '(' | ')' | '[' | ']' | '&' | '\'') {
+            normalized.push(character);
+        }
+    }
+    if !digits.is_empty() {
+        if digits.len() >= 5 { normalized.push_str("[number-redacted]") } else { normalized.push_str(&digits) }
+    }
+    let title = normalized.chars().take(96).collect::<String>();
+    if title.is_empty() { "none".to_string() } else { title }
+}
+
+fn classify_html_page(body: &str) -> &'static str {
+    let lowercase = body.to_ascii_lowercase();
+    if lowercase.contains("mobileme_terms_of_service_update")
+        || lowercase.contains("terms and conditions")
+        || lowercase.contains("terms of service") {
+        "terms-update"
+    } else if lowercase.contains("update_account_ui")
+        || (lowercase.contains("account") && lowercase.contains("repair")) {
+        "account-repair"
+    } else if lowercase.contains("boot_args") && lowercase.contains("appleauth") {
+        "apple-account-web-auth"
+    } else if lowercase.contains("securitycode")
+        || lowercase.contains("verification code")
+        || lowercase.contains("two-factor") {
+        "two-factor"
+    } else if lowercase.contains("sign in") || lowercase.contains("signin") {
+        "sign-in"
+    } else {
+        "unclassified-html"
+    }
+}
+
+fn safe_response_url(response: &Response) -> String {
+    let url = response.url();
+    let path = url.path().split('/').map(|segment| {
+        if segment.len() > 48 || segment.contains('@') { "[segment-redacted]" } else { segment }
+    }).collect::<Vec<_>>().join("/");
+    format!("{}://{}{}", url.scheme(), url.host_str().unwrap_or("unknown-host"), path)
+}
+
+fn unexpected_response_summary(stage: &str, status: reqwest::StatusCode, content_type: &str, final_url: &str, body: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+    format!(
+        "stage={stage}; status={}; content_type={}; final_url={final_url}; body_kind=html; page={}; title={}; bytes={}; sha256={}",
+        status.as_u16(), content_type.split(';').next().unwrap_or("unknown"), classify_html_page(body),
+        safe_html_title(body), body.len(), &digest[..16]
+    )
+}
+
+async fn parse_response(stage: &str, res: Result<Response, reqwest::Error>) -> Result<plist::Dictionary, crate::Error> {
+    let response = res?;
+    let status = response.status();
+    let final_url = safe_response_url(&response);
+    let content_type = response.headers().get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok()).unwrap_or("unknown").to_string();
+    let body = response.text().await?;
+    if looks_like_html(&body) {
+        let summary = unexpected_response_summary(stage, status, &content_type, &final_url, &body);
+        warn!("Unexpected Apple authentication response: {summary}");
+        return Err(crate::Error::UnexpectedResponse(summary));
+    }
+
+    let root: plist::Value = plist::from_bytes(body.as_bytes())?;
+    if let plist::Value::String(value) = &root {
+        if looks_like_html(value) {
+            let summary = unexpected_response_summary(stage, status, &content_type, &final_url, value);
+            warn!("Unexpected Apple authentication response: {summary}");
+            return Err(crate::Error::UnexpectedResponse(summary));
+        }
+    }
+    let plist::Value::Dictionary(mut root) = root else { return Err(crate::Error::Parse) };
+    match root.remove("Response") {
+        Some(plist::Value::Dictionary(dict)) => Ok(dict),
         _ => Err(crate::Error::Parse),
     }
 }
@@ -684,7 +778,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .body(buffer)
             .send().await;
 
-        let res = parse_response(res).await?;
+        let res = parse_response("srp-init", res).await?;
         let err_check = Self::check_error(&res);
         if err_check.is_err() {
             return Err(err_check.err().unwrap());
@@ -747,7 +841,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .body(buffer)
             .send().await;
 
-        let res = parse_response(res).await?;
+        let res = parse_response("srp-complete", res).await?;
         let err_check = Self::check_error(&res);
         if err_check.is_err() {
             return Err(err_check.err().unwrap());
@@ -1119,9 +1213,10 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::AppleAccount;
+    use super::{AppleAccount, unexpected_response_summary};
     use crate::Error;
     use plist::{Dictionary, Value};
+    use reqwest::StatusCode;
 
     #[test]
     fn two_factor_identity_rejects_absent_or_incomplete_spd() {
@@ -1158,5 +1253,34 @@ mod tests {
                 .expect("complete SPD should produce 2FA identity"),
             ("account-id", "identity-token")
         );
+    }
+
+    #[test]
+    fn unexpected_html_response_reports_safe_page_identity() {
+        let body = r#"<!doctype html><html><head><title>Update Apple Account</title></head>
+            <body data-account="person@example.com">MOBILEME_TERMS_OF_SERVICE_UPDATE 123456</body></html>"#;
+        let summary = unexpected_response_summary(
+            "srp-complete", StatusCode::OK, "text/html; charset=utf-8",
+            "https://gsa.apple.com/grandslam/GsService2", body,
+        );
+        assert!(summary.contains("stage=srp-complete"));
+        assert!(summary.contains("status=200"));
+        assert!(summary.contains("content_type=text/html"));
+        assert!(summary.contains("page=terms-update"));
+        assert!(summary.contains("title=Update Apple Account"));
+        assert!(!summary.contains("person@example.com"));
+        assert!(!summary.contains("123456"));
+    }
+
+    #[test]
+    fn unexpected_html_response_redacts_sensitive_title() {
+        let body = "<html><head><title>person@example.com 123456</title></head></html>";
+        let summary = unexpected_response_summary(
+            "srp-init", StatusCode::FORBIDDEN, "text/html",
+            "https://idmsa.apple.com/appleauth/auth/signin", body,
+        );
+        assert!(summary.contains("title=[redacted]"));
+        assert!(!summary.contains("person@example.com"));
+        assert!(!summary.contains("123456"));
     }
 }
