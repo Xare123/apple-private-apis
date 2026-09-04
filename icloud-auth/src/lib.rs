@@ -36,6 +36,16 @@ pub enum Error {
     SerdeError(#[from] serde_json::Error),
     #[error("Disable hardware authentication keys and try again!")]
     HardwareKeyError,
+    #[error("Malformed Apple SRP init response: missing or invalid '{0}'")]
+    MalformedSrpInit(&'static str),
+    #[error("Malformed Apple SRP complete response: missing or invalid '{0}'")]
+    MalformedSrpComplete(&'static str),
+    #[error("Apple SRP cryptography failed at '{0}'")]
+    SrpFailure(&'static str),
+    #[error("Failed to decrypt Apple SPD payload")]
+    SpdDecryptFailed,
+    #[error("Malformed Apple SPD payload: missing or invalid '{0}'")]
+    MalformedSpd(&'static str),
     #[error("cloud_sync_2fa_session_missing")]
     TwoFactorSessionMissing,
 }

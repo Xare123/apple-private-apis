@@ -213,38 +213,6 @@ fn looks_like_html(value: &str) -> bool {
     prefix.contains("<html") || prefix.contains("<!doctype html")
 }
 
-fn safe_html_title(body: &str) -> String {
-    let lowercase = body.to_ascii_lowercase();
-    let Some(title_start) = lowercase.find("<title") else { return "none".to_string() };
-    let Some(open_end) = lowercase[title_start..].find('>') else { return "malformed".to_string() };
-    let content_start = title_start + open_end + 1;
-    let Some(close_offset) = lowercase[content_start..].find("</title>") else { return "malformed".to_string() };
-    let raw = &body[content_start..content_start + close_offset];
-    if raw.contains('@') { return "[redacted]".to_string() }
-
-    let mut normalized = String::new();
-    let mut digits = String::new();
-    for character in raw.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
-        if character.is_ascii_digit() {
-            digits.push(character);
-            continue;
-        }
-        if !digits.is_empty() {
-            if digits.len() >= 5 { normalized.push_str("[number-redacted]") } else { normalized.push_str(&digits) }
-            digits.clear();
-        }
-        if character.is_ascii_alphanumeric()
-            || matches!(character, ' ' | '-' | '_' | ':' | '.' | ',' | '(' | ')' | '[' | ']' | '&' | '\'') {
-            normalized.push(character);
-        }
-    }
-    if !digits.is_empty() {
-        if digits.len() >= 5 { normalized.push_str("[number-redacted]") } else { normalized.push_str(&digits) }
-    }
-    let title = normalized.chars().take(96).collect::<String>();
-    if title.is_empty() { "none".to_string() } else { title }
-}
-
 fn classify_html_page(body: &str) -> &'static str {
     let lowercase = body.to_ascii_lowercase();
     if lowercase.contains("mobileme_terms_of_service_update")
@@ -269,18 +237,15 @@ fn classify_html_page(body: &str) -> &'static str {
 
 fn safe_response_url(response: &Response) -> String {
     let url = response.url();
-    let path = url.path().split('/').map(|segment| {
-        if segment.len() > 48 || segment.contains('@') { "[segment-redacted]" } else { segment }
-    }).collect::<Vec<_>>().join("/");
-    format!("{}://{}{}", url.scheme(), url.host_str().unwrap_or("unknown-host"), path)
+    format!("{}://{}", url.scheme(), url.host_str().unwrap_or("unknown-host"))
 }
 
 fn unexpected_response_summary(stage: &str, status: reqwest::StatusCode, content_type: &str, final_url: &str, body: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
     format!(
-        "stage={stage}; status={}; content_type={}; final_url={final_url}; body_kind=html; page={}; title={}; bytes={}; sha256={}",
+        "stage={stage}; status={}; content_type={}; final_origin={final_url}; body_kind=html; page={}; bytes={}; sha256={}",
         status.as_u16(), content_type.split(';').next().unwrap_or("unknown"), classify_html_page(body),
-        safe_html_title(body), body.len(), &digest[..16]
+        body.len(), &digest[..16]
     )
 }
 
@@ -309,6 +274,90 @@ async fn parse_response(stage: &str, res: Result<Response, reqwest::Error>) -> R
     match root.remove("Response") {
         Some(plist::Value::Dictionary(dict)) => Ok(dict),
         _ => Err(crate::Error::Parse),
+    }
+}
+
+struct SrpInitParams {
+    salt: Vec<u8>,
+    b_pub: Vec<u8>,
+    iters: u32,
+    c: String,
+}
+
+fn plist_u32(value: &plist::Value) -> Option<u32> {
+    value
+        .as_unsigned_integer()
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| {
+            value
+                .as_signed_integer()
+                .and_then(|value| u32::try_from(value).ok())
+        })
+}
+
+fn plist_i64(value: &plist::Value) -> Option<i64> {
+    value.as_signed_integer().or_else(|| {
+        value
+            .as_unsigned_integer()
+            .and_then(|value| i64::try_from(value).ok())
+    })
+}
+
+fn srp_init_params(res: &Dictionary) -> Result<SrpInitParams, crate::Error> {
+    let salt = res
+        .get("s")
+        .and_then(|v| v.as_data())
+        .ok_or(crate::Error::MalformedSrpInit("s"))?
+        .to_vec();
+    let b_pub = res
+        .get("B")
+        .and_then(|v| v.as_data())
+        .ok_or(crate::Error::MalformedSrpInit("B"))?
+        .to_vec();
+    let iters = res
+        .get("i")
+        .and_then(plist_u32)
+        .ok_or(crate::Error::MalformedSrpInit("i"))?;
+    let c = res
+        .get("c")
+        .and_then(|v| v.as_string())
+        .ok_or(crate::Error::MalformedSrpInit("c"))?
+        .to_string();
+    Ok(SrpInitParams { salt, b_pub, iters, c })
+}
+
+fn srp_complete_parts(res: &Dictionary) -> Result<(&[u8], &[u8], &Dictionary), crate::Error> {
+    let m2 = res
+        .get("M2")
+        .and_then(|v| v.as_data())
+        .ok_or(crate::Error::MalformedSrpComplete("M2"))?;
+    let spd = res
+        .get("spd")
+        .and_then(|v| v.as_data())
+        .ok_or(crate::Error::MalformedSrpComplete("spd"))?;
+    let status = res
+        .get("Status")
+        .and_then(|v| v.as_dictionary())
+        .ok_or(crate::Error::MalformedSrpComplete("Status"))?;
+    Ok((m2, spd, status))
+}
+
+fn spd_account_name(decoded_spd: &Dictionary) -> Result<&str, crate::Error> {
+    decoded_spd
+        .get("acname")
+        .and_then(|v| v.as_string())
+        .filter(|s| !s.is_empty())
+        .ok_or(crate::Error::MalformedSpd("acname"))
+}
+
+fn map_login_state(status: &Dictionary) -> LoginState {
+    match status.get("au") {
+        Some(plist::Value::String(s)) => match s.as_str() {
+            "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
+            "secondaryAuth" => LoginState::NeedsSMS2FA,
+            unk => LoginState::NeedsExtraStep(unk.to_string()),
+        },
+        _ => LoginState::LoggedIn,
     }
 }
 
@@ -779,15 +828,13 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await;
 
         let res = parse_response("srp-init", res).await?;
-        let err_check = Self::check_error(&res);
-        if err_check.is_err() {
-            return Err(err_check.err().unwrap());
-        }
+        Self::check_error(&res)?;
         // println!("{:?}", res);
-        let salt = res.get("s").unwrap().as_data().unwrap();
-        let b_pub = res.get("B").unwrap().as_data().unwrap(); // got this
-        let iters = res.get("i").unwrap().as_signed_integer().unwrap();
-        let c = res.get("c").unwrap().as_string().unwrap();
+        let init = srp_init_params(&res)?;
+        let salt = init.salt;
+        let b_pub = init.b_pub;
+        let iters = init.iters;
+        let c = init.c;
 
         self.hashed_password = Some(hashed_password.to_vec());
 
@@ -806,14 +853,14 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let mut password_buf = [0u8; 32];
         pbkdf2::pbkdf2::<hmac::Hmac<Sha256>>(
             &password_for_srp,
-            salt,
-            iters as u32,
+            &salt,
+            iters,
             &mut password_buf,
         );
 
         let verifier: SrpClientVerifier<Sha256> = srp_client
-            .process_reply(&a, &username.as_bytes(), &password_buf, salt, b_pub, true)
-            .unwrap();
+            .process_reply(&a, &username.as_bytes(), &password_buf, &salt, &b_pub, true)
+            .map_err(|_| crate::Error::SrpFailure("process-reply"))?;
 
         let m = verifier.proof();
 
@@ -842,19 +889,15 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await;
 
         let res = parse_response("srp-complete", res).await?;
-        let err_check = Self::check_error(&res);
-        if err_check.is_err() {
-            return Err(err_check.err().unwrap());
-        }
+        Self::check_error(&res)?;
         // println!("{:?}", res);
-        let m2 = res.get("M2").unwrap().as_data().unwrap();
-        verifier.verify_server(&m2).unwrap();
+        let (m2, spd, status) = srp_complete_parts(&res)?;
+        verifier
+            .verify_server(m2)
+            .map_err(|_| crate::Error::SrpFailure("verify-server"))?;
 
-        let spd = res.get("spd").unwrap().as_data().unwrap();
-        let decrypted_spd = Self::decrypt_cbc(&verifier, spd);
-        let decoded_spd: plist::Dictionary = plist::from_bytes(&decrypted_spd).unwrap();
-
-        let status = res.get("Status").unwrap().as_dictionary().unwrap();
+        let decrypted_spd = Self::decrypt_cbc(&verifier, spd)?;
+        let decoded_spd: plist::Dictionary = plist::from_bytes(&decrypted_spd)?;
 
         if let Some(Value::Dictionary(dict)) = decoded_spd.get("t") {
             let keys: HashMap<String, FetchedToken> = dict.iter().filter_map(|(service, value)| {
@@ -876,18 +919,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             decoded_spd.contains_key("t")
         );
 
-        self.username = Some(decoded_spd.get("acname").expect("No account name?").as_string().unwrap().to_string());
+        let account_name = spd_account_name(&decoded_spd)?.to_string();
+        self.username = Some(account_name);
         self.spd = Some(decoded_spd);
 
-        if let Some(plist::Value::String(s)) = status.get("au") {
-            return match s.as_str() {
-                "trustedDeviceSecondaryAuth" => Ok(LoginState::NeedsDevice2FA),
-                "secondaryAuth" => Ok(LoginState::NeedsSMS2FA),
-                _unk => Ok(LoginState::NeedsExtraStep(_unk.to_string()))
-            }
-        }
-
-        Ok(LoginState::LoggedIn)
+        Ok(map_login_state(status))
     }
 
     fn create_session_key(usr: &SrpClientVerifier<Sha256>, name: &str) -> Vec<u8> {
@@ -899,15 +935,16 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .to_vec()
     }
 
-    fn decrypt_cbc(usr: &SrpClientVerifier<Sha256>, data: &[u8]) -> Vec<u8> {
+    fn decrypt_cbc(usr: &SrpClientVerifier<Sha256>, data: &[u8]) -> Result<Vec<u8>, Error> {
         let extra_data_key = Self::create_session_key(usr, "extra data key:");
         let extra_data_iv = Self::create_session_key(usr, "extra data iv:");
         let extra_data_iv = &extra_data_iv[..16];
 
-        cbc::Decryptor::<aes::Aes256>::new_from_slices(&extra_data_key, extra_data_iv)
-            .unwrap()
-            .decrypt_padded_vec_mut::<Pkcs7>(&data)
-            .unwrap()
+        let decryptor = cbc::Decryptor::<aes::Aes256>::new_from_slices(&extra_data_key, extra_data_iv)
+            .map_err(|_| crate::Error::SpdDecryptFailed)?;
+        decryptor
+            .decrypt_padded_vec_mut::<Pkcs7>(data)
+            .map_err(|_| crate::Error::SpdDecryptFailed)
     }
 
     pub async fn send_2fa_to_devices(&self) -> Result<LoginState, crate::Error> {
@@ -1141,16 +1178,23 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     }
 
     fn check_error(res: &plist::Dictionary) -> Result<(), Error> {
-        let res = match res.get("Status") {
+        let status = match res.get("Status") {
             Some(plist::Value::Dictionary(d)) => d,
+            // Some responses carry ec/em at the top level without a Status dictionary.
             _ => &res,
         };
 
-        if res.get("ec").unwrap().as_signed_integer().unwrap() != 0 {
-            return Err(Error::AuthSrpWithMessage(
-                res.get("ec").unwrap().as_signed_integer().unwrap(),
-                res.get("em").unwrap().as_string().unwrap().to_owned(),
-            ));
+        let code = status
+            .get("ec")
+            .and_then(plist_i64)
+            .ok_or(crate::Error::Parse)?;
+
+        if code != 0 {
+            let message = status
+                .get("em")
+                .and_then(|v| v.as_string())
+                .unwrap_or("unknown");
+            return Err(Error::AuthSrpWithMessage(code, message.to_owned()));
         }
 
         Ok(())
@@ -1213,7 +1257,10 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppleAccount, unexpected_response_summary};
+    use super::{
+        AppleAccount, map_login_state, spd_account_name, srp_complete_parts,
+        srp_init_params, unexpected_response_summary, LoginState,
+    };
     use crate::Error;
     use plist::{Dictionary, Value};
     use reqwest::StatusCode;
@@ -1256,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_html_response_reports_safe_page_identity() {
+    fn unexpected_html_response_reports_only_safe_page_classification() {
         let body = r#"<!doctype html><html><head><title>Update Apple Account</title></head>
             <body data-account="person@example.com">MOBILEME_TERMS_OF_SERVICE_UPDATE 123456</body></html>"#;
         let summary = unexpected_response_summary(
@@ -1267,20 +1314,250 @@ mod tests {
         assert!(summary.contains("status=200"));
         assert!(summary.contains("content_type=text/html"));
         assert!(summary.contains("page=terms-update"));
-        assert!(summary.contains("title=Update Apple Account"));
+        assert!(summary.contains("final_origin=https://gsa.apple.com"));
+        assert!(!summary.contains("GsService2"));
+        assert!(!summary.contains("Update Apple Account"));
         assert!(!summary.contains("person@example.com"));
         assert!(!summary.contains("123456"));
     }
 
     #[test]
-    fn unexpected_html_response_redacts_sensitive_title() {
+    fn unexpected_html_response_omits_sensitive_title() {
         let body = "<html><head><title>person@example.com 123456</title></head></html>";
         let summary = unexpected_response_summary(
             "srp-init", StatusCode::FORBIDDEN, "text/html",
             "https://idmsa.apple.com/appleauth/auth/signin", body,
         );
-        assert!(summary.contains("title=[redacted]"));
+        assert!(!summary.contains("title="));
         assert!(!summary.contains("person@example.com"));
         assert!(!summary.contains("123456"));
+    }
+
+    fn wellformed_srp_init() -> Dictionary {
+        let mut res = Dictionary::new();
+        res.insert("s".to_string(), Value::Data(vec![1, 2, 3, 4]));
+        res.insert("B".to_string(), Value::Data(vec![5, 6, 7, 8]));
+        res.insert("i".to_string(), Value::Integer(4096.into()));
+        res.insert("c".to_string(), Value::String("challenge".to_string()));
+        res.insert(
+            "Status".to_string(),
+            Value::Dictionary(Dictionary::from_iter([
+                ("ec".to_string(), Value::Integer(0.into())),
+                ("em".to_string(), Value::String("Success".to_string())),
+            ])),
+        );
+        res
+    }
+
+    fn wellformed_srp_complete() -> Dictionary {
+        let mut res = Dictionary::new();
+        res.insert("M2".to_string(), Value::Data(vec![9, 10, 11]));
+        res.insert("spd".to_string(), Value::Data(vec![12, 13, 14]));
+        res.insert(
+            "Status".to_string(),
+            Value::Dictionary(Dictionary::from_iter([
+                ("ec".to_string(), Value::Integer(0.into())),
+                ("em".to_string(), Value::String("Success".to_string())),
+                ("au".to_string(), Value::String("trustedDeviceSecondaryAuth".to_string())),
+            ])),
+        );
+        res
+    }
+
+    #[test]
+    fn srp_init_accepts_wellformed_response() {
+        let res = wellformed_srp_init();
+        let init = srp_init_params(&res).expect("wellformed srp-init should parse");
+        assert_eq!(init.salt, vec![1, 2, 3, 4]);
+        assert_eq!(init.b_pub, vec![5, 6, 7, 8]);
+        assert_eq!(init.iters, 4096);
+        assert_eq!(init.c, "challenge");
+    }
+
+    #[test]
+    fn srp_init_rejects_missing_fields_without_panicking() {
+        for missing in ["s", "B", "i", "c"] {
+            let mut res = wellformed_srp_init();
+            res.remove(missing);
+            assert!(
+                matches!(srp_init_params(&res), Err(Error::MalformedSrpInit(_))),
+                "missing {missing} should be MalformedSrpInit"
+            );
+        }
+    }
+
+    #[test]
+    fn srp_init_rejects_wrong_types_and_negative_iters() {
+        let mut res = wellformed_srp_init();
+        res.insert("s".to_string(), Value::String("not-data".to_string()));
+        assert!(matches!(srp_init_params(&res), Err(Error::MalformedSrpInit("s"))));
+
+        let mut res = wellformed_srp_init();
+        res.insert("B".to_string(), Value::Integer(1.into()));
+        assert!(matches!(srp_init_params(&res), Err(Error::MalformedSrpInit("B"))));
+
+        let mut res = wellformed_srp_init();
+        res.insert("i".to_string(), Value::String("many".to_string()));
+        assert!(matches!(srp_init_params(&res), Err(Error::MalformedSrpInit("i"))));
+
+        let mut res = wellformed_srp_init();
+        res.insert("i".to_string(), Value::Integer((-1).into()));
+        assert!(matches!(srp_init_params(&res), Err(Error::MalformedSrpInit("i"))));
+
+        let mut res = wellformed_srp_init();
+        res.insert(
+            "i".to_string(),
+            Value::Integer((u64::from(u32::MAX) + 1).into()),
+        );
+        assert!(matches!(srp_init_params(&res), Err(Error::MalformedSrpInit("i"))));
+
+        let mut res = wellformed_srp_init();
+        res.insert("c".to_string(), Value::Data(vec![0]));
+        assert!(matches!(srp_init_params(&res), Err(Error::MalformedSrpInit("c"))));
+    }
+
+    #[test]
+    fn srp_complete_accepts_wellformed_response() {
+        let res = wellformed_srp_complete();
+        let (m2, spd, status) =
+            srp_complete_parts(&res).expect("wellformed srp-complete should parse");
+        assert_eq!(m2, &[9, 10, 11]);
+        assert_eq!(spd, &[12, 13, 14]);
+        assert!(status.contains_key("ec"));
+    }
+
+    #[test]
+    fn srp_complete_rejects_missing_or_mistyped_fields() {
+        for missing in ["M2", "spd", "Status"] {
+            let mut res = wellformed_srp_complete();
+            res.remove(missing);
+            assert!(
+                matches!(srp_complete_parts(&res), Err(Error::MalformedSrpComplete(_))),
+                "missing {missing} should be MalformedSrpComplete"
+            );
+        }
+
+        let mut res = wellformed_srp_complete();
+        res.insert("M2".to_string(), Value::String("not-data".to_string()));
+        assert!(matches!(
+            srp_complete_parts(&res),
+            Err(Error::MalformedSrpComplete("M2"))
+        ));
+
+        let mut res = wellformed_srp_complete();
+        res.insert("Status".to_string(), Value::String("not-a-dict".to_string()));
+        assert!(matches!(
+            srp_complete_parts(&res),
+            Err(Error::MalformedSrpComplete("Status"))
+        ));
+    }
+
+    #[test]
+    fn check_error_maps_server_status_without_panicking() {
+        type Provider = omnisette::DefaultAnisetteProvider;
+        let mut ok = Dictionary::new();
+        ok.insert(
+            "Status".to_string(),
+            Value::Dictionary(Dictionary::from_iter([
+                ("ec".to_string(), Value::Integer(0.into())),
+                ("em".to_string(), Value::String("Success".to_string())),
+            ])),
+        );
+        assert!(AppleAccount::<Provider>::check_error(&ok).is_ok());
+
+        let mut failed = Dictionary::new();
+        failed.insert(
+            "Status".to_string(),
+            Value::Dictionary(Dictionary::from_iter([
+                ("ec".to_string(), Value::Integer((-8711).into())),
+                ("em".to_string(), Value::String("Bad password".to_string())),
+            ])),
+        );
+        match AppleAccount::<Provider>::check_error(&failed) {
+            Err(Error::AuthSrpWithMessage(code, message)) => {
+                assert_eq!(code, -8711);
+                assert_eq!(message, "Bad password");
+            }
+            other => panic!("expected AuthSrpWithMessage, got {other:?}"),
+        }
+
+        let mut missing_code = Dictionary::new();
+        missing_code.insert(
+            "Status".to_string(),
+            Value::Dictionary(Dictionary::new()),
+        );
+        assert!(matches!(
+            AppleAccount::<Provider>::check_error(&missing_code),
+            Err(Error::Parse)
+        ));
+
+        let mut missing_message = Dictionary::new();
+        missing_message.insert(
+            "Status".to_string(),
+            Value::Dictionary(Dictionary::from_iter([(
+                "ec".to_string(),
+                Value::Integer(1.into()),
+            )])),
+        );
+        match AppleAccount::<Provider>::check_error(&missing_message) {
+            Err(Error::AuthSrpWithMessage(code, _)) => assert_eq!(code, 1),
+            other => panic!("expected AuthSrpWithMessage, got {other:?}"),
+        }
+
+        let unsigned_code = Dictionary::from_iter([
+            ("ec".to_string(), Value::Integer(2u64.into())),
+            ("em".to_string(), Value::String("Retry".to_string())),
+        ]);
+        match AppleAccount::<Provider>::check_error(&unsigned_code) {
+            Err(Error::AuthSrpWithMessage(code, message)) => {
+                assert_eq!(code, 2);
+                assert_eq!(message, "Retry");
+            }
+            other => panic!("expected unsigned AuthSrpWithMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spd_account_name_and_login_state_mapping_are_preserved() {
+        let mut spd = Dictionary::new();
+        assert!(matches!(
+            spd_account_name(&spd),
+            Err(Error::MalformedSpd("acname"))
+        ));
+        spd.insert("acname".to_string(), Value::String(String::new()));
+        assert!(matches!(
+            spd_account_name(&spd),
+            Err(Error::MalformedSpd("acname"))
+        ));
+        spd.insert("acname".to_string(), Value::String("user@example.com".to_string()));
+        assert_eq!(spd_account_name(&spd).expect("acname"), "user@example.com");
+
+        let mut status = Dictionary::new();
+        status.insert("ec".to_string(), Value::Integer(0.into()));
+        assert!(matches!(map_login_state(&status), LoginState::LoggedIn));
+
+        status.insert(
+            "au".to_string(),
+            Value::String("trustedDeviceSecondaryAuth".to_string()),
+        );
+        assert!(matches!(map_login_state(&status), LoginState::NeedsDevice2FA));
+
+        status.insert(
+            "au".to_string(),
+            Value::String("secondaryAuth".to_string()),
+        );
+        assert!(matches!(map_login_state(&status), LoginState::NeedsSMS2FA));
+
+        status.insert(
+            "au".to_string(),
+            Value::String("customStep".to_string()),
+        );
+        match map_login_state(&status) {
+            LoginState::NeedsExtraStep(step) => assert_eq!(step, "customStep"),
+            other => panic!("expected NeedsExtraStep, got {other:?}"),
+        }
+
+        status.insert("au".to_string(), Value::Integer(1.into()));
+        assert!(matches!(map_login_state(&status), LoginState::LoggedIn));
     }
 }
