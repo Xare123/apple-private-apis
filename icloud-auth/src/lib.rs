@@ -30,11 +30,11 @@ pub enum Error {
     ReqwestError(#[from] reqwest::Error),
     #[error("Failed getting anisette data {0}")]
     ErrorGettingAnisette(#[from] omnisette::AnisetteError),
-    #[error("Disable Advanced Data Protection")]
+    #[error("Apple could not load text-message verification options, so the app could not request an SMS. Sign-in is still waiting for verification.")]
     FailedGetting2FAConfig,
     #[error("Serde Error")]
     SerdeError(#[from] serde_json::Error),
-    #[error("Disable hardware authentication keys and try again!")]
+    #[error("Apple did not return a supported trusted phone number. Use a trusted-device verification code if available.")]
     HardwareKeyError,
     #[error("Malformed Apple SRP init response: missing or invalid '{0}'")]
     MalformedSrpInit(&'static str),

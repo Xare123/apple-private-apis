@@ -23,9 +23,12 @@ use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
-use crate::{AnisetteError, AnisetteProvider, LoginClientInfo};
+use crate::{AnisetteClientInfo, AnisetteError, AnisetteProvider, LoginClientInfo};
 
 const APPLE_ROOT: &[u8] = include_bytes!("../../icloud-auth/src/apple_root.der");
+// Official G3 anchor used by Apple's GSD provisioning/secondary-auth service.
+// Provenance and DER fingerprint are recorded beside the shared PEM in icloud-auth.
+const APPLE_ROOT_G3: &[u8] = include_bytes!("../../icloud-auth/src/apple_root_g3.pem");
 const MAX_PROVISION_ATTEMPTS: usize = 3;
 const PROVISION_RETRY_DELAY: Duration = Duration::from_millis(750);
 const MAX_GET_HEADERS_ATTEMPTS: usize = 3;
@@ -36,6 +39,35 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVISION_OVERALL_TIMEOUT: Duration = Duration::from_secs(45);
 const ALLOWED_ENDPOINT_HOSTS: [&str; 2] = ["ani.sidestore.io", "ani.sidestore.app"];
+const CLIENT_INFO_LIMIT: usize = 4096;
+
+fn decode_auth_client_info(implementation: &str, body: &[u8]) -> Result<AnisetteClientInfo, AnisetteError> {
+    if body.len() > CLIENT_INFO_LIMIT {
+        return Err(AnisetteError::InvalidClientMetadata);
+    }
+    let mut info: AnisetteClientInfo = serde_json::from_slice(body)
+        .map_err(|_| AnisetteError::InvalidClientMetadata)?;
+    for value in [&info.client_info, &info.user_agent] {
+        if value.is_empty() || value.len() > 1024 || !value.is_ascii()
+            || value.bytes().any(|b| b.is_ascii_control())
+            || reqwest::header::HeaderValue::from_str(value).is_err() {
+            return Err(AnisetteError::InvalidClientMetadata);
+        }
+    }
+    // v2.2.2 runs Android CoreADI but advertises the historical Mac template.
+    // Use the compatibility descriptor qualified against that implementation,
+    // not the Mac/iPhone identity used to activate iMessage. Do not override
+    // newer or differently described providers. Upstream evidence:
+    // https://github.com/Dadoum/anisette-v3-server/issues/61
+    // https://github.com/nab138/isideload/commit/fdb178814103dd7d3163dfd88f289ff0f76e8d47
+    if implementation == "anisette-v3-server v2.2.2"
+        && info.client_info == "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        && info.user_agent == "akd/1.0 CFNetwork/808.1.4" {
+        info.client_info = "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>".to_string();
+        debug!("anisette_v3 stage=client_info result=legacy_android_compat");
+    }
+    Ok(info)
+}
 
 fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, plist::Error> {
     plist_to_buf(value).map(|val| String::from_utf8(val).unwrap())
@@ -295,6 +327,7 @@ fn make_reqwest() -> Result<Client, AnisetteError> {
     Ok(ClientBuilder::new()
         .http1_title_case_headers()
         .add_root_certificate(Certificate::from_der(APPLE_ROOT)?)
+        .add_root_certificate(Certificate::from_pem(APPLE_ROOT_G3)?)
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_READ_TIMEOUT)
         .pool_idle_timeout(Duration::from_secs(30))
@@ -353,6 +386,7 @@ fn error_kind(error: &AnisetteError) -> &'static str {
         AnisetteError::InvalidLibraryFormat => "invalid_library",
         AnisetteError::Misc => "misc_error",
         AnisetteError::MissingLibraries => "missing_libraries",
+        AnisetteError::InvalidClientMetadata => "invalid_client_metadata",
         #[cfg(feature = "remote-clearadi")]
         AnisetteError::ClearADIError(_) => "clearadi_error",
         AnisetteError::Anyhow(_) => "internal_error",
@@ -408,6 +442,24 @@ fn reconcile_state_endpoint(state: &mut AnisetteState, endpoint: &str) -> StateB
 }
 
 impl AnisetteClient {
+    async fn fetch_auth_client_info(&self) -> Result<AnisetteClientInfo, AnisetteError> {
+        // Same allowlisted HTTPS provider and strict redirect/TLS policy as the
+        // ADI request. No username, password, identity or provisioning body.
+        let mut response = self.relay_http_client
+            .get(format!("{}/v3/client_info", self.url))
+            .send().await?.error_for_status()?;
+        let implementation = response.headers().get("Implementation-Version")
+            .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > CLIENT_INFO_LIMIT - body.len() {
+                return Err(AnisetteError::InvalidClientMetadata);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        decode_auth_client_info(&implementation, &body)
+    }
+
     pub async fn new(
         url: String,
         login_info: LoginClientInfo,
@@ -837,6 +889,7 @@ pub struct RemoteAnisetteProviderV3 {
     pub state: Option<AnisetteState>,
     configuration_path: PathBuf,
     info: LoginClientInfo,
+    auth_client_info: Option<AnisetteClientInfo>,
 }
 
 impl RemoteAnisetteProviderV3 {
@@ -851,15 +904,23 @@ impl RemoteAnisetteProviderV3 {
             state: None,
             configuration_path,
             info,
+            auth_client_info: None,
         }
     }
 }
 
 impl AnisetteProvider for RemoteAnisetteProviderV3 {
+    fn auth_client_info(&self) -> Option<&AnisetteClientInfo> {
+        self.auth_client_info.as_ref()
+    }
+
     async fn get_anisette_headers(&mut self) -> Result<HashMap<String, String>, AnisetteError> {
         if self.client.is_none() {
-            self.client =
-                Some(AnisetteClient::new(self.client_url.clone(), self.info.clone()).await?);
+            let mut client = AnisetteClient::new(self.client_url.clone(), self.info.clone()).await?;
+            let auth_info = client.fetch_auth_client_info().await?;
+            client.login_info.use_anisette_client_info(&auth_info);
+            self.auth_client_info = Some(auth_info);
+            self.client = Some(client);
         }
         let client = self.client.as_ref().unwrap();
 
@@ -910,6 +971,74 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_fixture(client_info: &str, user_agent: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"client_info":client_info,"user_agent":user_agent})).unwrap()
+    }
+
+    #[test]
+    fn auth_metadata_corrects_only_the_known_android_provider_template() {
+        let old = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+        let ua = "akd/1.0 CFNetwork/808.1.4";
+        let body = metadata_fixture(old, ua);
+        let corrected = decode_auth_client_info("anisette-v3-server v2.2.2", &body).unwrap();
+        assert_eq!(corrected.client_info, "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>");
+        assert_eq!(corrected.user_agent, ua);
+        for implementation in ["", "different-provider v2.2.2", "anisette-v3-server v2.3.0"] {
+            assert_eq!(decode_auth_client_info(implementation, &body).unwrap().client_info, old);
+        }
+        let other_ua = metadata_fixture(old, "different-library/1");
+        assert_eq!(decode_auth_client_info("anisette-v3-server v2.2.2", &other_ua).unwrap().client_info, old);
+    }
+
+    #[test]
+    fn auth_metadata_preserves_new_provider_descriptions() {
+        for descriptor in ["<PC> <Windows;10> <com.apple.AuthKit/1>",
+            "<Android> <Android;14> <com.apple.AuthKit/1>"] {
+            let body = metadata_fixture(descriptor, "provider-auth/1");
+            let result = decode_auth_client_info("anisette-v3-server v2.2.2", &body).unwrap();
+            assert_eq!(result.client_info, descriptor);
+            assert_eq!(result.user_agent, "provider-auth/1");
+        }
+    }
+
+    #[test]
+    fn auth_metadata_rejects_invalid_or_unbounded_header_values() {
+        for value in ["", "bad\r\nInjected: value", "bad\u{0}value", "nonascii-\u{e9}", &"a".repeat(1025)] {
+            for body in [metadata_fixture(value, "ua/1"), metadata_fixture("<Android>", value)] {
+                assert!(matches!(decode_auth_client_info("", &body), Err(AnisetteError::InvalidClientMetadata)));
+            }
+        }
+        for body in [b"<html>private response</html>".to_vec(), b"{}".to_vec(), vec![b' '; CLIENT_INFO_LIMIT + 1]] {
+            assert!(matches!(decode_auth_client_info("", &body), Err(AnisetteError::InvalidClientMetadata)));
+        }
+    }
+
+    #[test]
+    fn apple_trust_anchors_match_official_certificates() {
+        assert_eq!(hex::encode(Sha256::digest(APPLE_ROOT)),
+            "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024");
+        let pem = std::str::from_utf8(APPLE_ROOT_G3).unwrap();
+        let encoded: String = pem.lines().filter(|line| !line.starts_with("-----")).collect();
+        let der = general_purpose::STANDARD.decode(encoded).unwrap();
+        assert_eq!(hex::encode(Sha256::digest(der)),
+            "63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "manual public HTTPS reachability only; no account, anisette, provisioning or SMS requests"]
+    async fn public_apple_secondary_auth_tls() {
+        // Exercise the production Apple client, not an insecure diagnostic client.
+        // An unauthenticated rejection is still evidence of a completed TLS exchange.
+        let client = make_reqwest().unwrap();
+        for host in ["gsa.apple.com", "gsd.apple.com"] {
+            let response = client.get(format!("https://{host}/auth")).send().await.unwrap();
+            assert_eq!(response.url().scheme(), "https");
+            assert_eq!(response.url().host_str(), Some(host));
+            println!("public_apple_tls host={host}; status={}; account_requests=0; provisioning_requests=0; sms_requests=0",
+                response.status().as_u16());
+        }
+    }
 
     #[test]
     fn parses_end_provisioning_error_as_retryable_server_error() {

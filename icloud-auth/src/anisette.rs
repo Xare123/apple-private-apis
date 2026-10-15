@@ -10,8 +10,11 @@ pub struct AnisetteData {
 
 impl AnisetteData {
     /// Fetches the data at an anisette server
-    pub async fn new<T: AnisetteProvider>(provider: &mut AnisetteClient<T>, client_info: LoginClientInfo) -> Result<Self, crate::Error> {
+    pub async fn new<T: AnisetteProvider>(provider: &mut AnisetteClient<T>, mut client_info: LoginClientInfo) -> Result<Self, crate::Error> {
         let base_headers = provider.get_headers().await?.clone();
+        if let Some(info) = provider.provider.auth_client_info() {
+            client_info.use_anisette_client_info(info);
+        }
 
         Ok(AnisetteData { base_headers, client_info })
     }
@@ -178,5 +181,90 @@ impl AnisetteData {
             ].into_iter().map(|(a, b)| (a.to_string(), b.to_string())))
             .chain(self.client_info.hardware_headers.clone())
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod provider_client_info_tests {
+    use super::*;
+    use omnisette::{AnisetteClientInfo, AnisetteError};
+
+    struct FixtureProvider {
+        metadata: Option<AnisetteClientInfo>,
+        calls: usize,
+        fail: bool,
+    }
+
+    impl AnisetteProvider for FixtureProvider {
+        async fn get_anisette_headers(&mut self) -> Result<HashMap<String, String>, AnisetteError> {
+            self.calls += 1;
+            if self.fail { return Err(AnisetteError::Misc); }
+            Ok(HashMap::from_iter([
+                ("X-Apple-I-MD".into(), "synthetic-proof".into()),
+                ("X-Mme-Device-Id".into(), "synthetic-provider-id".into()),
+            ]))
+        }
+        fn auth_client_info(&self) -> Option<&AnisetteClientInfo> { self.metadata.as_ref() }
+    }
+
+    fn activation_info() -> LoginClientInfo {
+        LoginClientInfo {
+            ak_context_type: "imessage".into(),
+            client_app_name: "Messages".into(),
+            client_bundle_id: "com.apple.MobileSMS".into(),
+            mme_client_info: "synthetic-activation-client".into(),
+            mme_client_info_akd: "synthetic-activation-akd".into(),
+            akd_user_agent: "synthetic-activation-agent".into(),
+            browser_user_agent: "synthetic-browser-agent".into(),
+            hardware_headers: HashMap::from_iter([("X-Apple-I-SRL-NO".into(), "synthetic-serial".into())]),
+            push_token: Some("synthetic-aps-token".into()),
+            update_account_bundle_id: "synthetic-recovery-context".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_client_metadata_follows_adi_without_changing_activation() {
+        let original = activation_info();
+        let mut provider = AnisetteClient::new(FixtureProvider {
+            metadata: Some(AnisetteClientInfo { client_info: "synthetic-android-auth".into(), user_agent: "synthetic-provider-agent".into() }),
+            calls: 0, fail: false,
+        });
+        // Cached proofs must retain the same provider metadata too.
+        for _ in 0..2 {
+            let data = AnisetteData::new(&mut provider, original.clone()).await.unwrap();
+            assert_eq!(data.get_gsservice_headers()["X-MMe-Client-Info"], "synthetic-android-auth");
+            assert_eq!(data.get_gsservice_headers()["User-Agent"], "synthetic-provider-agent");
+            assert_eq!(data.get_extra_headers()["X-MMe-Client-Info"], "synthetic-android-auth");
+            assert_eq!(data.get_gsservice_headers()["X-Apple-I-MD"], "synthetic-proof");
+            let cpd = data.get_cpd_data("synthetic-request");
+            assert_eq!(cpd["X-Apple-I-SRL-NO"].as_string(), Some("synthetic-serial"));
+            assert_eq!(cpd["ptkn"].as_string(), Some("synthetic-aps-token"));
+            assert_eq!(cpd["X-Mme-Device-Id"].as_string(), Some("synthetic-provider-id"));
+            assert_eq!(data.client_info.ak_context_type, original.ak_context_type);
+            assert_eq!(data.client_info.client_app_name, original.client_app_name);
+            assert_eq!(data.client_info.client_bundle_id, original.client_bundle_id);
+            assert_eq!(data.client_info.hardware_headers, original.hardware_headers);
+            assert_eq!(data.client_info.browser_user_agent, original.browser_user_agent);
+            assert_eq!(data.client_info.update_account_bundle_id, original.update_account_bundle_id);
+        }
+        assert_eq!(provider.provider.calls, 1);
+        assert_eq!(original.mme_client_info, "synthetic-activation-client");
+    }
+
+    #[tokio::test]
+    async fn provider_without_metadata_keeps_native_client_info() {
+        let mut provider = AnisetteClient::new(FixtureProvider { metadata: None, calls: 0, fail: false });
+        let original = activation_info();
+        let data = AnisetteData::new(&mut provider, original.clone()).await.unwrap();
+        assert_eq!(data.client_info.mme_client_info, original.mme_client_info);
+        assert_eq!(data.client_info.mme_client_info_akd, original.mme_client_info_akd);
+        assert_eq!(data.client_info.akd_user_agent, original.akd_user_agent);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_never_produces_authentication_headers() {
+        let mut provider = AnisetteClient::new(FixtureProvider { metadata: None, calls: 0, fail: true });
+        assert!(AnisetteData::new(&mut provider, activation_info()).await.is_err());
+        assert_eq!(provider.provider.calls, 1);
     }
 }

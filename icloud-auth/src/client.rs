@@ -17,12 +17,44 @@ use srp::{
     client::{SrpClient, SrpClientVerifier},
     groups::G_2048,
 };
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const GSA_ENDPOINT: &str = "https://gsa.apple.com/grandslam/GsService2";
 const APPLE_ROOT: &[u8] = include_bytes!("./apple_root.der");
+// https://www.apple.com/certificateauthority/AppleRootCA-G3.cer
+// DER SHA256: 63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179.
+// Apple's Android secondary-auth service chains to G3, not the legacy root.
+const APPLE_ROOT_G3: &[u8] = include_bytes!("./apple_root_g3.pem");
+
+#[path = "auth_options.rs"]
+mod auth_options;
+
+#[derive(Clone, Copy)]
+enum AuthResponseStage {
+    SrpInit,
+    SrpComplete,
+    TrustedDeviceVerification,
+}
+
+impl AuthResponseStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SrpInit => "srp-init",
+            Self::SrpComplete => "srp-complete",
+            Self::TrustedDeviceVerification => "trusted-device-verification",
+        }
+    }
+}
+
+// Only fixed stage names and numeric status may enter this diagnostic. Never
+// include the response dictionary, server message, account name or SRP material.
+fn auth_status_summary(stage: AuthResponseStage, code: Option<i64>, hsc: Option<i64>) -> String {
+    let code = code.map(|value| value.to_string()).unwrap_or_else(|| "missing-or-invalid".to_string());
+    let hsc = hsc.map(|value| value.to_string()).unwrap_or_else(|| "absent-or-invalid".to_string());
+    format!("stage={}; code={code}; hsc={hsc}", stage.label())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InitRequestBody {
@@ -105,6 +137,13 @@ pub struct AppleAccount<T: AnisetteProvider> {
     client: Client,
     pub tokens: HashMap<String, FetchedToken>,
     pub hashed_password: Option<Vec<u8>>,
+    // Private protocol discriminator only. Production keeps its existing route
+    // until the server-selected service is qualified with a real SMS session.
+    #[cfg(test)]
+    secondary_auth_origin: &'static str,
+    // Isolated comparison only, enabled explicitly by the private probe.
+    #[cfg(all(test, feature = "remote-anisette-v3"))]
+    secondary_auth_session: Option<Mutex<HeaderMap>>,
 }
 
 #[derive(Serialize)]
@@ -235,15 +274,20 @@ fn classify_html_page(body: &str) -> &'static str {
     }
 }
 
-fn safe_response_url(response: &Response) -> String {
-    let url = response.url();
-    format!("{}://{}", url.scheme(), url.host_str().unwrap_or("unknown-host"))
+fn safe_response_origin(value: &str) -> String {
+    match reqwest::Url::parse(value) {
+        Ok(url) if matches!(url.scheme(), "https" | "http") && url.host_str().is_some() => {
+            format!("{}://{}", url.scheme(), url.host_str().unwrap())
+        }
+        _ => "unknown-origin".to_string(),
+    }
 }
 
 fn unexpected_response_summary(stage: &str, status: reqwest::StatusCode, content_type: &str, final_url: &str, body: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+    let final_origin = safe_response_origin(final_url);
     format!(
-        "stage={stage}; status={}; content_type={}; final_origin={final_url}; body_kind=html; page={}; bytes={}; sha256={}",
+        "stage={stage}; status={}; content_type={}; final_origin={final_origin}; body_kind=html; page={}; bytes={}; sha256={}",
         status.as_u16(), content_type.split(';').next().unwrap_or("unknown"), classify_html_page(body),
         body.len(), &digest[..16]
     )
@@ -251,8 +295,10 @@ fn unexpected_response_summary(stage: &str, status: reqwest::StatusCode, content
 
 async fn parse_response(stage: &str, res: Result<Response, reqwest::Error>) -> Result<plist::Dictionary, crate::Error> {
     let response = res?;
+    #[cfg(all(test, feature = "remote-anisette-v3"))]
+    auth_probe::report_session_headers(stage, response.headers());
     let status = response.status();
-    let final_url = safe_response_url(&response);
+    let final_url = safe_response_origin(response.url().as_str());
     let content_type = response.headers().get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok()).unwrap_or("unknown").to_string();
     let body = response.text().await?;
@@ -357,6 +403,10 @@ fn map_login_state(status: &Dictionary) -> LoginState {
             "secondaryAuth" => LoginState::NeedsSMS2FA,
             unk => LoginState::NeedsExtraStep(unk.to_string()),
         },
+        // Apple can omit `au` when a trusted-device verification challenge was
+        // already sent. A valid SRP proof is not completed two-factor login.
+        _ if status.get("hsc").and_then(Value::as_signed_integer) == Some(409) =>
+            LoginState::Needs2FAVerification,
         _ => LoginState::LoggedIn,
     }
 }
@@ -367,6 +417,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let client = ClientBuilder::new()
             .cookie_store(true)
             .add_root_certificate(Certificate::from_der(APPLE_ROOT)?)
+            .add_root_certificate(Certificate::from_pem(APPLE_ROOT_G3)?)
             // .proxy(Proxy::https("https://192.168.99.71:8080").unwrap())
             // .danger_accept_invalid_certs(true)
             .http1_title_case_headers()
@@ -381,6 +432,10 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             username: None,
             tokens: HashMap::new(),
             hashed_password: None,
+            #[cfg(test)]
+            secondary_auth_origin: "https://gsa.apple.com",
+            #[cfg(all(test, feature = "remote-anisette-v3"))]
+            secondary_auth_session: None,
         })
     }
 
@@ -774,19 +829,13 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         Ok(LoginState::LoggedIn)
     }
 
-    pub async fn login_email_pass(
-        &mut self,
+    async fn request_srp_init(
+        &self,
         username: &str,
-        hashed_password: &[u8],
-    ) -> Result<LoginState, Error> {
-        let srp_client = SrpClient::<Sha256>::new(&G_2048);
-        let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
-        let a_pub = srp_client.compute_public_ephemeral(&a);
-
-        self.username = Some(username.to_string());
-
-        let valid_anisette = self.get_anisette().await?;
-
+        a_pub: Vec<u8>,
+        valid_anisette: &AnisetteData,
+        request_id: &str,
+    ) -> Result<(Dictionary, HeaderMap), Error> {
         let mut gsa_headers = HeaderMap::new();
         gsa_headers.insert(
             "Content-Type",
@@ -795,14 +844,12 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         gsa_headers.insert("Accept", HeaderValue::from_str("*/*").unwrap());
         gsa_headers.extend(valid_anisette.get_gsservice_headers().into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), HeaderValue::from_str(&b).unwrap())));
 
-        let request_id = Uuid::new_v4().to_string().to_uppercase();
-
         let header = RequestHeader {
             version: "1.0.1".to_string(),
         };
         let body = InitRequestBody {
             a_pub: plist::Value::Data(a_pub),
-            cpd: valid_anisette.get_cpd_data(&request_id),
+            cpd: valid_anisette.get_cpd_data(request_id),
             operation: "init".to_string(),
             ps: vec!["s2k".to_string(), "s2k_fo".to_string()],
             username: username.to_string(),
@@ -827,8 +874,28 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .body(buffer)
             .send().await;
 
-        let res = parse_response("srp-init", res).await?;
-        Self::check_error(&res)?;
+        let stage = AuthResponseStage::SrpInit;
+        let res = parse_response(stage.label(), res).await?;
+        Self::check_error_at_stage(stage, &res)?;
+        Ok((res, gsa_headers))
+    }
+
+    pub async fn login_email_pass(
+        &mut self,
+        username: &str,
+        hashed_password: &[u8],
+    ) -> Result<LoginState, Error> {
+        let srp_client = SrpClient::<Sha256>::new(&G_2048);
+        let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let a_pub = srp_client.compute_public_ephemeral(&a);
+
+        self.username = Some(username.to_string());
+        let valid_anisette = self.get_anisette().await?;
+        let request_id = Uuid::new_v4().to_string().to_uppercase();
+        let header = RequestHeader { version: "1.0.1".to_string() };
+        let (res, gsa_headers) = self.request_srp_init(
+            username, a_pub, &valid_anisette, &request_id,
+        ).await?;
         // println!("{:?}", res);
         let init = srp_init_params(&res)?;
         let salt = init.salt;
@@ -888,8 +955,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .body(buffer)
             .send().await;
 
-        let res = parse_response("srp-complete", res).await?;
-        Self::check_error(&res)?;
+        let stage = AuthResponseStage::SrpComplete;
+        let res = parse_response(stage.label(), res).await?;
+        Self::check_error_at_stage(stage, &res)?;
         // println!("{:?}", res);
         let (m2, spd, status) = srp_complete_parts(&res)?;
         verifier
@@ -947,6 +1015,14 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .map_err(|_| crate::Error::SpdDecryptFailed)
     }
 
+    fn secondary_auth_endpoint(&self, suffix: &str) -> String {
+        #[cfg(test)]
+        let origin = self.secondary_auth_origin;
+        #[cfg(not(test))]
+        let origin = "https://gsa.apple.com";
+        format!("{origin}/auth{suffix}")
+    }
+
     pub async fn send_2fa_to_devices(&self) -> Result<LoginState, crate::Error> {
         let headers = self.build_2fa_headers(false);
 
@@ -979,15 +1055,18 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let res = self
             .client
-            .put("https://gsa.apple.com/auth/verify/phone")
+            .put(self.secondary_auth_endpoint("/verify/phone"))
             .headers(headers.await?)
             .header("Accept", "application/json")
             .json(&body)
             .send().await?;
 
+        debug!("Apple authentication HTTP: stage=sms-request; status={}", res.status().as_u16());
         if !res.status().is_success() {
             return Err(Error::AuthSrp);
         }
+        #[cfg(all(test, feature = "remote-anisette-v3"))]
+        self.retain_probe_session(&res, "/verify/phone").await?;
 
         return Ok(LoginState::NeedsSMS2FAVerification(body));
     }
@@ -996,36 +1075,27 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let headers = self.build_2fa_headers(true);
 
         let req = self.client
-            .get("https://gsa.apple.com/auth")
+            .get(self.secondary_auth_endpoint(""))
             .headers(headers.await?)
             .header("Accept", "application/json")
             .send().await?;
-        let status = req.status().as_u16();
-        if status == 403 {
-            warn!("Failed to retrieve GSA authentication extras (HTTP 403)");
-            return Err(Error::FailedGetting2FAConfig);
+        #[cfg(all(test, feature = "remote-anisette-v3"))]
+        if req.status().is_success() {
+            self.retain_probe_session(&req, "").await?;
         }
-        let resp = req.bytes().await?;
-        let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
-        info!(
-            "Parsed GSA authentication extras (trusted_phone_count={}, has_new_state={})",
-            new_state.trusted_phone_numbers.len(),
-            new_state.new_state.is_some()
-        );
-        if new_state.trusted_phone_numbers.is_empty() {
-            return Err(Error::HardwareKeyError);
-        }
-        if status == 201 {
-            new_state.new_state = Some(LoginState::NeedsSMS2FAVerification(VerifyBody {
-                phone_number: PhoneNumber {
-                    id: new_state.trusted_phone_numbers.first().unwrap().id
-                },
-                mode: "sms".to_string(),
-                security_code: None
-            }));
-        }
+        auth_options::parse_auth_options_response(req).await
+    }
 
-        Ok(new_state)
+    #[cfg(all(test, feature = "remote-anisette-v3"))]
+    async fn retain_probe_session(&self, response: &Response, suffix: &str) -> Result<(), Error> {
+        if let Some(session) = &self.secondary_auth_session {
+            if response.url().as_str() != self.secondary_auth_endpoint(suffix) {
+                return Err(Error::UnexpectedResponse("secondary-auth-origin-changed".into()));
+            }
+            let updates = auth_probe::continuation_headers(response.headers())?;
+            session.lock().await.extend(updates);
+        }
+        Ok(())
     }
 
     pub async fn request_update_account(&self) -> Result<String, Error> {
@@ -1087,7 +1157,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let res: plist::Dictionary =
             plist::from_bytes(res.text().await?.as_bytes())?;
 
-        Self::check_error(&res)?;
+        Self::check_error_at_stage(AuthResponseStage::TrustedDeviceVerification, &res)?;
 
         // this endpoint is stupid
         // in the SMS 2fa endpoint, all tokens have format ID:TOKEN:DURATION:EXP (MS SINCE EPOCH)
@@ -1134,7 +1204,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let res = self
             .client
-            .post("https://gsa.apple.com/auth/verify/phone/securitycode")
+            .post(self.secondary_auth_endpoint("/verify/phone/securitycode"))
             .headers(headers)
             .header("accept", "application/json")
             .json(&body)
@@ -1200,6 +1270,21 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         Ok(())
     }
 
+    fn check_error_at_stage(stage: AuthResponseStage, res: &plist::Dictionary) -> Result<(), Error> {
+        let result = Self::check_error(res);
+        let status = res.get("Status").and_then(Value::as_dictionary).unwrap_or(res);
+        let hsc = status.get("hsc").and_then(plist_i64);
+        match &result {
+            Ok(()) => debug!("Apple authentication status: {}", auth_status_summary(stage, Some(0), hsc)),
+            Err(Error::AuthSrpWithMessage(code, _)) => {
+                warn!("Apple authentication status: {}", auth_status_summary(stage, Some(*code), hsc));
+            }
+            Err(_) => warn!("Apple authentication status: {}", auth_status_summary(stage, None, hsc)),
+        }
+        // Preserve the existing error variant, message and retry behavior.
+        result
+    }
+
     // pub async 
 
     fn two_factor_identity(
@@ -1249,17 +1334,26 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             "X-Apple-Identity-Token",
             HeaderValue::from_str(&identity_token).unwrap(),
         );
-
+        #[cfg(all(test, feature = "remote-anisette-v3"))]
+        if sms {
+            if let Some(session) = &self.secondary_auth_session {
+                headers.extend(session.lock().await.clone());
+            }
+        }
 
         Ok(headers)
     }
 }
 
+#[cfg(all(test, feature = "remote-anisette-v3"))]
+#[path = "auth_probe.rs"]
+mod auth_probe;
+
 #[cfg(test)]
 mod tests {
     use super::{
         AppleAccount, map_login_state, spd_account_name, srp_complete_parts,
-        srp_init_params, unexpected_response_summary, LoginState,
+        srp_init_params, unexpected_response_summary, auth_status_summary, AuthResponseStage, LoginState,
     };
     use crate::Error;
     use plist::{Dictionary, Value};
@@ -1331,6 +1425,24 @@ mod tests {
         assert!(!summary.contains("title="));
         assert!(!summary.contains("person@example.com"));
         assert!(!summary.contains("123456"));
+    }
+
+    #[test]
+    fn unexpected_html_response_strips_url_credentials_path_query_and_fragment() {
+        let summary = unexpected_response_summary(
+            "srp-init", StatusCode::FORBIDDEN, "text/html",
+            "https://synthetic-user:synthetic-password@gsa.apple.com/private-path?account=person@example.test#synthetic-code",
+            "<html>Sign in</html>",
+        );
+        assert!(summary.contains("final_origin=https://gsa.apple.com;"));
+        for private in ["synthetic-user", "synthetic-password", "private-path", "person@example.test", "synthetic-code"] {
+            assert!(!summary.contains(private));
+        }
+        for invalid in ["not-a-url-with-synthetic-secret", "data:text/plain,synthetic-secret"] {
+            let summary = unexpected_response_summary("srp-init", StatusCode::OK, "text/html", invalid, "<html></html>");
+            assert!(summary.contains("final_origin=unknown-origin;"));
+            assert!(!summary.contains("synthetic-secret"));
+        }
     }
 
     fn wellformed_srp_init() -> Dictionary {
@@ -1453,6 +1565,64 @@ mod tests {
     }
 
     #[test]
+    fn auth_status_summary_distinguishes_fixed_stages_without_response_contents() {
+        for (stage, expected) in [
+            (AuthResponseStage::SrpInit, "srp-init"),
+            (AuthResponseStage::SrpComplete, "srp-complete"),
+            (AuthResponseStage::TrustedDeviceVerification, "trusted-device-verification"),
+        ] {
+            assert_eq!(auth_status_summary(stage, Some(-80045), None), format!("stage={expected}; code=-80045; hsc=absent-or-invalid"));
+            assert_eq!(auth_status_summary(stage, Some(0), Some(409)), format!("stage={expected}; code=0; hsc=409"));
+            assert_eq!(auth_status_summary(stage, None, Some(434)), format!("stage={expected}; code=missing-or-invalid; hsc=434"));
+        }
+    }
+
+    #[test]
+    fn auth_stage_diagnostics_preserve_server_rejection_and_success() {
+        type Provider = omnisette::DefaultAnisetteProvider;
+        for stage in [AuthResponseStage::SrpInit, AuthResponseStage::SrpComplete, AuthResponseStage::TrustedDeviceVerification] {
+            let response = Dictionary::from_iter([(
+                "Status".to_string(),
+                Value::Dictionary(Dictionary::from_iter([
+                    ("ec".to_string(), Value::Integer((-80045).into())),
+                    ("hsc".to_string(), Value::Integer(434.into())),
+                    ("em".to_string(), Value::String("synthetic account@example.test response".to_string())),
+                    ("X-Apple-I-MD-DATA".to_string(), Value::String("synthetic-challenge-secret".to_string())),
+                ])),
+            )]);
+            match AppleAccount::<Provider>::check_error_at_stage(stage, &response) {
+                Err(Error::AuthSrpWithMessage(code, message)) => {
+                    assert_eq!(code, -80045);
+                    assert_eq!(message, "synthetic account@example.test response");
+                    let diagnostic = auth_status_summary(stage, Some(code), Some(434));
+                    assert!(!diagnostic.contains(&message));
+                    assert!(!diagnostic.contains("account@example.test"));
+                    assert!(!diagnostic.contains("synthetic-challenge-secret"));
+                }
+                other => panic!("expected unchanged server rejection, got {other:?}"),
+            }
+            let success = Dictionary::from_iter([("ec".to_string(), Value::Integer(0.into()))]);
+            assert!(AppleAccount::<Provider>::check_error_at_stage(stage, &success).is_ok());
+        }
+    }
+
+    #[test]
+    fn auth_stage_diagnostics_preserve_malformed_status_failure() {
+        type Provider = omnisette::DefaultAnisetteProvider;
+        for invalid in [Value::String("synthetic-secret".to_string()), Value::Data(vec![1, 2, 3])] {
+            let response = Dictionary::from_iter([("ec".to_string(), invalid)]);
+            assert!(matches!(
+                AppleAccount::<Provider>::check_error_at_stage(AuthResponseStage::SrpInit, &response),
+                Err(Error::Parse)
+            ));
+        }
+        assert!(matches!(
+            AppleAccount::<Provider>::check_error_at_stage(AuthResponseStage::SrpComplete, &Dictionary::new()),
+            Err(Error::Parse)
+        ));
+    }
+
+    #[test]
     fn check_error_maps_server_status_without_panicking() {
         type Provider = omnisette::DefaultAnisetteProvider;
         let mut ok = Dictionary::new();
@@ -1518,6 +1688,20 @@ mod tests {
     }
 
     #[test]
+    fn already_sent_challenge_is_not_treated_as_logged_in() {
+        let mut status = Dictionary::from_iter([
+            ("ec".to_string(), Value::Integer(0.into())),
+            ("hsc".to_string(), Value::Integer(409.into())),
+        ]);
+        assert!(matches!(map_login_state(&status), LoginState::Needs2FAVerification));
+        status.insert("au".to_string(), Value::String("secondaryAuth".to_string()));
+        assert!(matches!(map_login_state(&status), LoginState::NeedsSMS2FA));
+        status.remove("au");
+        status.insert("hsc".to_string(), Value::Integer(200.into()));
+        assert!(matches!(map_login_state(&status), LoginState::LoggedIn));
+    }
+
+    #[test]
     fn spd_account_name_and_login_state_mapping_are_preserved() {
         let mut spd = Dictionary::new();
         assert!(matches!(
@@ -1559,5 +1743,18 @@ mod tests {
 
         status.insert("au".to_string(), Value::Integer(1.into()));
         assert!(matches!(map_login_state(&status), LoginState::LoggedIn));
+    }
+
+    #[test]
+    fn unavailable_verification_options_do_not_instruct_security_downgrade() {
+        for error in [Error::FailedGetting2FAConfig, Error::HardwareKeyError] {
+            let message = error.to_string();
+            assert!(!message.to_lowercase().contains("disable"));
+        }
+        let options_failure = Error::FailedGetting2FAConfig.to_string();
+        assert!(options_failure.contains("could not request an SMS"));
+        assert!(options_failure.contains("Sign-in is still waiting for verification"));
+        assert!(!options_failure.contains("trusted-device"));
+        assert!(Error::HardwareKeyError.to_string().contains("trusted-device verification code"));
     }
 }

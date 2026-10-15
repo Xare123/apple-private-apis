@@ -70,6 +70,8 @@ pub enum AnisetteError {
     Misc,
     #[error("Missing Libraries")]
     MissingLibraries,
+    #[error("The authentication provider returned invalid client metadata. Saved activation and account data have not been reset.")]
+    InvalidClientMetadata,
     #[cfg(feature = "remote-clearadi")]
     #[error("ClearADI Error {0}")]
     ClearADIError(#[from] clearadi::ClearAdiError),
@@ -83,6 +85,9 @@ pub const DEFAULT_ANISETTE_URL_V3: &str = "https://ani.sidestore.io";
 
 pub trait AnisetteProvider {
     fn get_anisette_headers(&mut self) -> impl std::future::Future<Output = Result<HashMap<String, String>, AnisetteError>> + Send;
+    /// Describes the library that produced the ADI proof, not the user's IDS
+    /// activation hardware. Available after a successful header request.
+    fn auth_client_info(&self) -> Option<&AnisetteClientInfo> { None }
     fn get_2fa_code(&mut self) -> impl std::future::Future<Output = Result<u32, AnisetteError>> + Send {
         async {
             Err(AnisetteError::MissingLibraries)
@@ -186,6 +191,22 @@ pub struct LoginClientInfo {
     pub hardware_headers: HashMap<String, String>,
     pub push_token: Option<String>,
     pub update_account_bundle_id: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+pub struct AnisetteClientInfo {
+    pub client_info: String,
+    pub user_agent: String,
+}
+
+impl LoginClientInfo {
+    /// Keep account context, genuine hardware headers, APS token and recovery
+    /// identity intact. Only authentication-client descriptions follow ADI.
+    pub fn use_anisette_client_info(&mut self, info: &AnisetteClientInfo) {
+        self.mme_client_info = info.client_info.clone();
+        self.mme_client_info_akd = info.client_info.clone();
+        self.akd_user_agent = info.user_agent.clone();
+    }
 }
 
 
