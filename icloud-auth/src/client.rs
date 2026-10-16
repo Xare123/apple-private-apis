@@ -298,6 +298,17 @@ async fn parse_response(stage: &str, res: Result<Response, reqwest::Error>) -> R
     #[cfg(all(test, feature = "remote-anisette-v3"))]
     auth_probe::report_session_headers(stage, response.headers());
     let status = response.status();
+    // An infrastructure/rate-limit response is not an SRP challenge or an
+    // account rejection. Do not read an arbitrary error body, retry the login,
+    // or replace the primary HTTP failure with a plist/body-read failure.
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        warn!("Apple authentication HTTP: stage={stage}; status={}", status.as_u16());
+        return Err(if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            crate::Error::AuthenticationRateLimited
+        } else {
+            crate::Error::AuthenticationServiceUnavailable(status.as_u16())
+        });
+    }
     let final_url = safe_response_origin(response.url().as_str());
     let content_type = response.headers().get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok()).unwrap_or("unknown").to_string();
@@ -1348,6 +1359,14 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 #[cfg(all(test, feature = "remote-anisette-v3"))]
 #[path = "auth_probe.rs"]
 mod auth_probe;
+
+#[cfg(test)]
+#[path = "public_transport_tests.rs"]
+mod public_transport_tests;
+
+#[cfg(test)]
+#[path = "response_error_tests.rs"]
+mod response_error_tests;
 
 #[cfg(test)]
 mod tests {

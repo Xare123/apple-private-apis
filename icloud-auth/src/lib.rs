@@ -26,6 +26,10 @@ pub enum Error {
     PlistError(#[from] plist::Error),
     #[error("Unexpected Apple authentication response ({0})")]
     UnexpectedResponse(String),
+    #[error("Apple's sign-in service returned a server error (HTTP {0}). Please try again later. This error does not require resetting your activation details.")]
+    AuthenticationServiceUnavailable(u16),
+    #[error("Apple is limiting sign-in requests (HTTP 429). Please wait before trying again.")]
+    AuthenticationRateLimited,
     #[error("Request failed {0}")]
     ReqwestError(#[from] reqwest::Error),
     #[error("Failed getting anisette data {0}")]
