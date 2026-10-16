@@ -30,6 +30,9 @@ const APPLE_ROOT_G3: &[u8] = include_bytes!("./apple_root_g3.pem");
 
 #[path = "auth_options.rs"]
 mod auth_options;
+#[path = "auth_routes.rs"]
+mod auth_routes;
+use auth_routes::{AuthRoutes, BoundAuthRoutes};
 
 #[derive(Clone, Copy)]
 enum AuthResponseStage {
@@ -137,10 +140,12 @@ pub struct AppleAccount<T: AnisetteProvider> {
     client: Client,
     pub tokens: HashMap<String, FetchedToken>,
     pub hashed_password: Option<Vec<u8>>,
-    // Private protocol discriminator only. Production keeps its existing route
-    // until the server-selected service is qualified with a real SMS session.
+    // Bound only after a verified SRP exchange. Verification must keep the
+    // same client and service selection that created its identity token.
+    auth_routes: Option<BoundAuthRoutes>,
+    // Synthetic/manual route fixtures only; production always uses lookup.
     #[cfg(test)]
-    secondary_auth_origin: &'static str,
+    auth_routes_override: Option<AuthRoutes>,
     // Isolated comparison only, enabled explicitly by the private probe.
     #[cfg(all(test, feature = "remote-anisette-v3"))]
     secondary_auth_session: Option<Mutex<HeaderMap>>,
@@ -293,21 +298,109 @@ fn unexpected_response_summary(stage: &str, status: reqwest::StatusCode, content
     )
 }
 
+/// Strict bounds for the single HTTP/500 exception below. Every other 5xx and
+/// 429 never reads the body. A 500 body that is larger, slower, malformed,
+/// HTML, or success-shaped stays a generic service error.
+const HTTP500_MAX_BODY_BYTES: usize = 16 * 1024;
+const HTTP500_BODY_TIMEOUT: Duration = Duration::from_secs(1);
+
 async fn parse_response(stage: &str, res: Result<Response, reqwest::Error>) -> Result<plist::Dictionary, crate::Error> {
     let response = res?;
     #[cfg(all(test, feature = "remote-anisette-v3"))]
     auth_probe::report_session_headers(stage, response.headers());
     let status = response.status();
-    // An infrastructure/rate-limit response is not an SRP challenge or an
-    // account rejection. Do not read an arbitrary error body, retry the login,
-    // or replace the primary HTTP failure with a plist/body-read failure.
-    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+    // Rate limiting is never an SRP challenge or an account rejection.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         warn!("Apple authentication HTTP: stage={stage}; status={}", status.as_u16());
-        return Err(if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            crate::Error::AuthenticationRateLimited
-        } else {
+        return Err(crate::Error::AuthenticationRateLimited);
+    }
+    // Other infrastructure 5xx responses are not SRP challenges either. Do not
+    // read an arbitrary error body, retry the login, or replace the primary
+    // HTTP failure with a plist/body-read failure.
+    if status.is_server_error() && status != reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+        warn!("Apple authentication HTTP: stage={stage}; status={}", status.as_u16());
+        return Err(crate::Error::AuthenticationServiceUnavailable(status.as_u16()));
+    }
+    if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+        // Bounded HTTP/500 exception only: Apple can return a structured SRP
+        // rejection (for example ec -80045, upstream provider issue 61)
+        // inside a plist on HTTP 500. Preserve only a nonzero structured
+        // rejection for the existing stage check. Everything else stays
+        // fail-closed as generic 500 without logging body contents.
+        let unavailable = || {
+            warn!("Apple authentication HTTP: stage={stage}; status={}", status.as_u16());
             crate::Error::AuthenticationServiceUnavailable(status.as_u16())
-        });
+        };
+        if let Some(len) = response.content_length() {
+            if len > HTTP500_MAX_BODY_BYTES as u64 {
+                return Err(unavailable());
+            }
+        }
+        // Incrementally cap the body BEFORE retaining each chunk, inside one
+        // total <=1s budget. This bounds unknown/chunked bodies too: an
+        // oversized first chunk (or stalled remainder) is rejected without
+        // buffering the full body or waiting for the stalled remainder.
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut response = response;
+        let read = async {
+            loop {
+                let chunk = response.chunk().await?;
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                if bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .filter(|total| *total <= HTTP500_MAX_BODY_BYTES)
+                    .is_none()
+                {
+                    return Err(crate::Error::AuthenticationServiceUnavailable(
+                        status.as_u16(),
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok::<_, crate::Error>(())
+        };
+        // A timeout, read failure, or size limit preserves the original 500.
+        if !matches!(tokio::time::timeout(HTTP500_BODY_TIMEOUT, read).await, Ok(Ok(()))) {
+            return Err(unavailable());
+        }
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if looks_like_html(text) {
+                return Err(unavailable());
+            }
+        }
+        let root: plist::Value = match plist::from_bytes(&bytes) {
+            Ok(root) => root,
+            Err(_) => return Err(unavailable()),
+        };
+        if let plist::Value::String(value) = &root {
+            if looks_like_html(value) {
+                return Err(unavailable());
+            }
+        }
+        let plist::Value::Dictionary(mut root) = root else {
+            return Err(unavailable());
+        };
+        let Some(dict) = root.remove("Response").and_then(|value| match value {
+            plist::Value::Dictionary(dict) => Some(dict),
+            _ => None,
+        }) else {
+            return Err(unavailable());
+        };
+        let status_dict = dict
+            .get("Status")
+            .and_then(plist::Value::as_dictionary)
+            .unwrap_or(&dict);
+        let Some(code) = status_dict.get("ec").and_then(plist_i64) else {
+            return Err(unavailable());
+        };
+        if code == 0 {
+            // Never accept HTTP 500 ec=0 as authentication success.
+            return Err(unavailable());
+        }
+        return Ok(dict);
     }
     let final_url = safe_response_origin(response.url().as_str());
     let content_type = response.headers().get(CONTENT_TYPE)
@@ -443,8 +536,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             username: None,
             tokens: HashMap::new(),
             hashed_password: None,
+            auth_routes: None,
             #[cfg(test)]
-            secondary_auth_origin: "https://gsa.apple.com",
+            auth_routes_override: None,
             #[cfg(all(test, feature = "remote-anisette-v3"))]
             secondary_auth_session: None,
         })
@@ -842,6 +936,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
     async fn request_srp_init(
         &self,
+        endpoint: &str,
         username: &str,
         a_pub: Vec<u8>,
         valid_anisette: &AnisetteData,
@@ -880,7 +975,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let res = self
             .client
-            .post(GSA_ENDPOINT)
+            .post(endpoint)
             .headers(gsa_headers.clone())
             .body(buffer)
             .send().await;
@@ -896,16 +991,24 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         username: &str,
         hashed_password: &[u8],
     ) -> Result<LoginState, Error> {
+        // A new exchange supersedes the previous verification challenge even
+        // if lookup, transport, proof verification, or cancellation stops it.
+        // Drop only this ephemeral authority before the first await; do not
+        // erase saved profile data. Only verified SRP below grants a new binding.
+        self.auth_routes = None;
         let srp_client = SrpClient::<Sha256>::new(&G_2048);
         let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
         let a_pub = srp_client.compute_public_ephemeral(&a);
 
         self.username = Some(username.to_string());
         let valid_anisette = self.get_anisette().await?;
+        // Use the effective provider metadata, not the activation hardware's
+        // original description. A single selection governs both SRP stages.
+        let routes = self.select_auth_routes(&valid_anisette.client_info).await?;
         let request_id = Uuid::new_v4().to_string().to_uppercase();
         let header = RequestHeader { version: "1.0.1".to_string() };
         let (res, gsa_headers) = self.request_srp_init(
-            username, a_pub, &valid_anisette, &request_id,
+            routes.srp, username, a_pub, &valid_anisette, &request_id,
         ).await?;
         // println!("{:?}", res);
         let init = srp_init_params(&res)?;
@@ -961,7 +1064,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let res = self
             .client
-            .post(GSA_ENDPOINT)
+            .post(routes.srp)
             .headers(gsa_headers.clone())
             .body(buffer)
             .send().await;
@@ -1001,6 +1104,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let account_name = spd_account_name(&decoded_spd)?.to_string();
         self.username = Some(account_name);
         self.spd = Some(decoded_spd);
+        self.auth_routes = Some(BoundAuthRoutes::new(routes, &valid_anisette.client_info));
 
         Ok(map_login_state(status))
     }
@@ -1026,12 +1130,21 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .map_err(|_| crate::Error::SpdDecryptFailed)
     }
 
-    fn secondary_auth_endpoint(&self, suffix: &str) -> String {
+    async fn select_auth_routes(&self, info: &LoginClientInfo) -> Result<AuthRoutes, Error> {
         #[cfg(test)]
-        let origin = self.secondary_auth_origin;
-        #[cfg(not(test))]
-        let origin = "https://gsa.apple.com";
-        format!("{origin}/auth{suffix}")
+        if let Some(routes) = self.auth_routes_override { return Ok(routes); }
+        // Refresh lookup at a new SRP exchange. No per-request discovery while
+        // entering a code and no guessing/default route on lookup failure.
+        auth_routes::lookup(info).await
+    }
+
+    fn session_auth_routes(&self) -> Result<AuthRoutes, Error> {
+        self.auth_routes.as_ref().map(|binding| binding.routes)
+            .ok_or(Error::TwoFactorSessionMissing)
+    }
+
+    fn secondary_auth_endpoint(&self, suffix: &str) -> Result<String, Error> {
+        Ok(self.session_auth_routes()?.secondary_endpoint(suffix))
     }
 
     pub async fn send_2fa_to_devices(&self) -> Result<LoginState, crate::Error> {
@@ -1039,7 +1152,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let res = self
             .client
-            .get("https://gsa.apple.com/auth/verify/trusteddevice")
+            .get(self.session_auth_routes()?.trusted_device)
             .headers(headers.await?)
             .send().await?;
 
@@ -1066,7 +1179,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let res = self
             .client
-            .put(self.secondary_auth_endpoint("/verify/phone"))
+            .put(self.secondary_auth_endpoint("/verify/phone")?)
             .headers(headers.await?)
             .header("Accept", "application/json")
             .json(&body)
@@ -1086,7 +1199,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let headers = self.build_2fa_headers(true);
 
         let req = self.client
-            .get(self.secondary_auth_endpoint(""))
+            .get(self.secondary_auth_endpoint("")?)
             .headers(headers.await?)
             .header("Accept", "application/json")
             .send().await?;
@@ -1100,7 +1213,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     #[cfg(all(test, feature = "remote-anisette-v3"))]
     async fn retain_probe_session(&self, response: &Response, suffix: &str) -> Result<(), Error> {
         if let Some(session) = &self.secondary_auth_session {
-            if response.url().as_str() != self.secondary_auth_endpoint(suffix) {
+            if response.url().as_str() != self.secondary_auth_endpoint(suffix)? {
                 return Err(Error::UnexpectedResponse("secondary-auth-origin-changed".into()));
             }
             let updates = auth_probe::continuation_headers(response.headers())?;
@@ -1155,7 +1268,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         // println!("Recieved code: {}", code);
         let res = self
             .client
-            .get("https://gsa.apple.com/grandslam/GsService2/validate")
+            .get(self.session_auth_routes()?.validate_code)
             .headers(headers.await?)
             .header(
                 HeaderName::from_str("security-code").unwrap(),
@@ -1215,7 +1328,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let res = self
             .client
-            .post(self.secondary_auth_endpoint("/verify/phone/securitycode"))
+            .post(self.secondary_auth_endpoint("/verify/phone/securitycode")?)
             .headers(headers)
             .header("accept", "application/json")
             .json(&body)
@@ -1320,7 +1433,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         let identity_token = base64::encode(format!("{}:{}", dsid, token));
 
+        let binding = self.auth_routes.as_ref().ok_or(Error::TwoFactorSessionMissing)?;
         let valid_anisette = self.get_anisette().await?;
+        binding.require_matching(&valid_anisette.client_info)?;
 
         let mut headers = HeaderMap::new();
         valid_anisette
@@ -1367,6 +1482,10 @@ mod public_transport_tests;
 #[cfg(test)]
 #[path = "response_error_tests.rs"]
 mod response_error_tests;
+
+#[cfg(test)]
+#[path = "auth_routing_integration_tests.rs"]
+mod auth_routing_integration_tests;
 
 #[cfg(test)]
 mod tests {

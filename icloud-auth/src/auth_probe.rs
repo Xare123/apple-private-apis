@@ -178,7 +178,7 @@ async fn run_probe(input: ProbeInput) -> Result<bool, Error> {
     let srp = SrpClient::<Sha256>::new(&G_2048);
     let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let (response, _) = account.request_srp_init(
-        &username, srp.compute_public_ephemeral(&a), &anisette,
+        GSA_ENDPOINT, &username, srp.compute_public_ephemeral(&a), &anisette,
         &Uuid::new_v4().to_string().to_uppercase(),
     ).await?;
     // Validate only the shape. Do not display challenge/salt or calculate proof.
@@ -249,6 +249,253 @@ async fn retained_profile_srp_init_only() {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MetadataComparisonInput {
+    context: ProbeInput,
+    implementation: String,
+    advertised: omnisette::AnisetteClientInfo,
+}
+
+fn comparison_metadata(implementation: &str, advertised: &omnisette::AnisetteClientInfo)
+    -> Result<omnisette::AnisetteClientInfo, Error>
+{
+    // Exactly the current production v2.2.2 compatibility predicate. Refuse a
+    // changed provider instead of silently testing a different configuration.
+    if implementation != "anisette-v3-server v2.2.2"
+        || advertised.client_info != "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        || advertised.user_agent != "akd/1.0 CFNetwork/808.1.4" {
+        return Err(Error::Parse);
+    }
+    Ok(omnisette::AnisetteClientInfo {
+        client_info: "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>".into(),
+        user_agent: advertised.user_agent.clone(),
+    })
+}
+
+fn metadata_variant(original: &AnisetteData, metadata: &omnisette::AnisetteClientInfo) -> AnisetteData {
+    let mut client_info = original.client_info.clone();
+    client_info.use_anisette_client_info(metadata);
+    AnisetteData { base_headers: original.base_headers.clone(), client_info }
+}
+
+fn init_comparison_outcome(result: &Result<(Dictionary, HeaderMap), Error>) -> (&'static str, u16) {
+    match result {
+        Ok((response, _)) if srp_init_params(response).is_ok() => ("init-accepted", 0),
+        Ok(_) => ("invalid-challenge", 0),
+        Err(Error::AuthenticationServiceUnavailable(status)) => ("service-unavailable", *status),
+        Err(Error::AuthenticationRateLimited) => ("rate-limited", 429),
+        Err(Error::AuthSrpWithMessage(_, _)) | Err(Error::AuthSrp) => ("apple-rejected", 0),
+        Err(_) => ("transport-or-response-error", 0),
+    }
+}
+
+async fn run_metadata_comparison(input: MetadataComparisonInput) -> Result<(), Error> {
+    if input.context.native_windows.is_some() || input.context.username.is_empty() {
+        return Err(Error::Parse);
+    }
+    let metadata = comparison_metadata(&input.implementation, &input.advertised)?;
+    let username = input.context.username.clone();
+    let original_account = prepared_account(input.context).await?;
+    // One provider fetch; never provision, reset, or persist provider state.
+    let original = original_account.get_anisette().await?;
+    let current = metadata_variant(&original, &metadata);
+    if original.get_cpd_data("comparison") != current.get_cpd_data("comparison") {
+        return Err(Error::Parse);
+    }
+    // Separate cookie jars prevent the first server response from changing the
+    // second request. Both use the production constructor, endpoint and TLS.
+    let current_account = AppleAccount::new_with_anisette(
+        current.client_info.clone(), original_account.anisette.clone())?;
+    let mut submissions = 0;
+    for (label, account, data) in [
+        ("original-hardware", &original_account, &original),
+        ("current-provider", &current_account, &current),
+    ] {
+        println!("comparison_variant={label}");
+        io::stdout().flush().ok();
+        let srp = SrpClient::<Sha256>::new(&G_2048);
+        let secret: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+        let request_id = Uuid::new_v4().to_string().to_uppercase();
+        submissions += 1;
+        let result = tokio::time::timeout(Duration::from_secs(15), account.request_srp_init(
+            GSA_ENDPOINT, &username, srp.compute_public_ephemeral(&secret), data, &request_id,
+        )).await;
+        let (outcome, status) = match &result {
+            Ok(result) => init_comparison_outcome(result),
+            Err(_) => ("bounded-timeout", 0),
+        };
+        println!("comparison_result: variant={label}; outcome={outcome}; http={status}");
+        // Stop on throttling or an unclassified transport/shape failure. A
+        // classifiable 5xx remains a measured result, not an automatic retry.
+        if matches!(outcome, "rate-limited" | "bounded-timeout" | "transport-or-response-error" | "invalid-challenge") {
+            break;
+        }
+    }
+    println!("comparison_complete: init_requests={submissions}; provider_fetches=1; password_submissions=0; sms_requests=0; persistence_writes=0");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual private comparison; at most two SRP-init requests, no password or SMS"]
+async fn retained_profile_client_metadata_comparison() {
+    let mut raw = Vec::new();
+    io::stdin().take(65537).read_to_end(&mut raw).expect("private stdin read failed");
+    assert!(raw.len() <= 65536, "private input exceeds bound");
+    let input: MetadataComparisonInput = serde_json::from_slice(&raw).expect("private schema invalid");
+    log::set_logger(&LOGGER).expect("isolated logger required");
+    log::set_max_level(log::LevelFilter::Debug);
+    match tokio::time::timeout(Duration::from_secs(50), run_metadata_comparison(input)).await {
+        Ok(Ok(())) => {},
+        Ok(Err(_)) => panic!("comparison preparation failed; private details withheld"),
+        Err(_) => panic!("comparison exceeded overall deadline"),
+    }
+}
+
+#[test]
+fn metadata_comparison_changes_only_client_description_headers() {
+    let original = AnisetteData { base_headers: HashMap::from([
+        ("X-Apple-I-MD".into(), "synthetic-proof".into()),
+        ("X-Mme-Device-Id".into(), "synthetic-provider-id".into()),
+    ]), client_info: LoginClientInfo {
+        mme_client_info: "synthetic-hardware".into(), mme_client_info_akd: "synthetic-hardware-akd".into(),
+        akd_user_agent: "synthetic-hardware-agent".into(),
+        hardware_headers: HashMap::from([("X-Apple-I-SRL-NO".into(), "synthetic-serial".into())]),
+        push_token: Some("synthetic-push".into()), ..Default::default()
+    }};
+    let changed = metadata_variant(&original, &omnisette::AnisetteClientInfo {
+        client_info: "synthetic-provider".into(), user_agent: "synthetic-provider-agent".into(),
+    });
+    assert_eq!(original.base_headers, changed.base_headers);
+    assert_eq!(original.get_cpd_data("same-request"), changed.get_cpd_data("same-request"));
+    let left = original.get_gsservice_headers();
+    let right = changed.get_gsservice_headers();
+    let mut differences: Vec<_> = left.iter().filter(|(key, value)| right.get(*key) != Some(*value))
+        .map(|(key, _)| key.as_str()).collect();
+    differences.sort_unstable();
+    assert_eq!(left.len(), right.len());
+    assert_eq!(differences, ["User-Agent", "X-MMe-Client-Info"]);
+}
+
+#[test]
+fn metadata_comparison_rejects_changed_provider_and_hides_error_text() {
+    let mut advertised = omnisette::AnisetteClientInfo {
+        client_info: "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>".into(),
+        user_agent: "akd/1.0 CFNetwork/808.1.4".into(),
+    };
+    assert!(comparison_metadata("anisette-v3-server v2.2.2", &advertised).is_ok());
+    assert!(comparison_metadata("different-provider", &advertised).is_err());
+    advertised.user_agent = "changed".into();
+    assert!(comparison_metadata("anisette-v3-server v2.2.2", &advertised).is_err());
+    assert_eq!(init_comparison_outcome(&Err(Error::AuthSrpWithMessage(-80045, "private account text".into()))), ("apple-rejected", 0));
+    assert_eq!(init_comparison_outcome(&Err(Error::AuthenticationServiceUnavailable(503))), ("service-unavailable", 503));
+    assert_eq!(init_comparison_outcome(&Err(Error::AuthenticationRateLimited)), ("rate-limited", 429));
+}
+
+fn srp_endpoint_from_bag(bag: &Dictionary) -> Result<&'static str, Error> {
+    let endpoint = bag.get("urls").and_then(Value::as_dictionary)
+        .and_then(|urls| urls.get("gsService")).and_then(Value::as_string);
+    match endpoint {
+        Some(GSA_ENDPOINT) => Ok(GSA_ENDPOINT),
+        Some("https://gsd.apple.com/grandslam/GsService2") =>
+            Ok("https://gsd.apple.com/grandslam/GsService2"),
+        _ => Err(Error::UnexpectedResponse("unsupported-srp-service".into())),
+    }
+}
+
+async fn run_server_selected_init(input: MetadataComparisonInput) -> Result<(), Error> {
+    if input.context.native_windows.is_some() || input.context.username.is_empty() {
+        return Err(Error::Parse);
+    }
+    let metadata = comparison_metadata(&input.implementation, &input.advertised)?;
+    let username = input.context.username.clone();
+    let lookup_account = prepared_account(input.context).await?;
+    let original = lookup_account.get_anisette().await?;
+    let current = metadata_variant(&original, &metadata);
+    // Lookup carries only public client descriptors. No proof, hardware or
+    // account headers. Keep its cookie jar separate from the SRP request.
+    let lookup_url = format!("{GSA_ENDPOINT}/lookup");
+    let mut response = lookup_account.client.get(&lookup_url)
+        .header("X-MMe-Client-Info", &current.client_info.mme_client_info_akd)
+        .header("User-Agent", &current.client_info.akd_user_agent)
+        .header("Accept", "text/x-xml-plist")
+        .send().await?.error_for_status()?;
+    if response.url().as_str() != lookup_url { return Err(Error::Parse); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > 65536 - bytes.len() { return Err(Error::Parse); }
+        bytes.extend_from_slice(&chunk);
+    }
+    let bag: Dictionary = plist::from_bytes(&bytes)?;
+    let endpoint = srp_endpoint_from_bag(&bag)?;
+    // An unchanged route does not justify repeating the failed request.
+    if endpoint == GSA_ENDPOINT {
+        return Err(Error::UnexpectedResponse("srp-route-unchanged".into()));
+    }
+    println!("route_probe_service=gsd; lookup_status=200");
+    let account = AppleAccount::new_with_anisette(
+        current.client_info.clone(), lookup_account.anisette.clone())?;
+    let srp = SrpClient::<Sha256>::new(&G_2048);
+    let secret: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+    let result = tokio::time::timeout(Duration::from_secs(15), account.request_srp_init(
+        endpoint, &username, srp.compute_public_ephemeral(&secret), &current,
+        &Uuid::new_v4().to_string().to_uppercase(),
+    )).await;
+    let (outcome, status) = match &result {
+        Ok(result) => init_comparison_outcome(result),
+        Err(_) => ("bounded-timeout", 0),
+    };
+    println!("route_probe_result: outcome={outcome}; http={status}");
+    println!("route_probe_complete: init_requests=1; provider_fetches=1; password_submissions=0; sms_requests=0; persistence_writes=0");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual private SRP-init check using only the exact Apple-selected service"]
+async fn retained_profile_server_selected_init() {
+    let mut raw = Vec::new();
+    io::stdin().take(65537).read_to_end(&mut raw).expect("private stdin read failed");
+    assert!(raw.len() <= 65536, "private input exceeds bound");
+    let input: MetadataComparisonInput = serde_json::from_slice(&raw).expect("private schema invalid");
+    log::set_logger(&LOGGER).expect("isolated logger required");
+    log::set_max_level(log::LevelFilter::Debug);
+    match tokio::time::timeout(Duration::from_secs(50), run_server_selected_init(input)).await {
+        Ok(Ok(())) => {},
+        Ok(Err(_)) => panic!("route preparation failed; private details withheld"),
+        Err(_) => panic!("route probe exceeded overall deadline"),
+    }
+}
+
+#[test]
+fn srp_route_accepts_only_exact_official_services() {
+    for url in [GSA_ENDPOINT, "https://gsd.apple.com/grandslam/GsService2"] {
+        let bag = Dictionary::from_iter([("urls", Value::Dictionary(
+            Dictionary::from_iter([("gsService", Value::String(url.into()))]))) ]);
+        assert_eq!(srp_endpoint_from_bag(&bag).unwrap(), url);
+    }
+}
+
+#[test]
+fn srp_route_rejects_missing_untrusted_and_non_srp_paths() {
+    assert!(srp_endpoint_from_bag(&Dictionary::new()).is_err());
+    for url in ["http://gsd.apple.com/grandslam/GsService2",
+        "https://gsd.apple.com.evil.test/grandslam/GsService2",
+        "https://gsd.apple.com/grandslam/GsService2?redirect=1",
+        "https://gsd.apple.com/auth", "https://gsa.apple.com/grandslam/GsService2/"] {
+        let bag = Dictionary::from_iter([("urls", Value::Dictionary(
+            Dictionary::from_iter([("gsService", Value::String(url.into()))]))) ]);
+        assert!(srp_endpoint_from_bag(&bag).is_err());
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProbeVerificationChannel {
+    #[default]
+    Sms,
+    ManualDeviceCode,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PasswordProbeInput {
     context: ProbeInput,
     password_sha256: String,
@@ -256,9 +503,13 @@ struct PasswordProbeInput {
     #[serde(default)]
     server_selected_sms: bool,
     #[serde(default)]
+    server_selected_auth: bool,
+    #[serde(default)]
     sms_bootstrap_only: bool,
     #[serde(default)]
     sms_session_replay: bool,
+    #[serde(default)]
+    verification_channel: ProbeVerificationChannel,
 }
 
 pub(super) fn report_session_headers(stage: &str, headers: &HeaderMap) {
@@ -309,10 +560,10 @@ pub(super) fn continuation_headers(headers: &HeaderMap) -> Result<HeaderMap, Err
 }
 
 async fn inspect_sms_bootstrap(account: &AppleAccount<ProbeProvider>) -> Result<HeaderMap, Error> {
-    let mut response = account.client.get(account.secondary_auth_endpoint(""))
+    let mut response = account.client.get(account.secondary_auth_endpoint("")?)
         .headers(bootstrap_headers(account.build_2fa_headers(true).await?))
         .send().await?;
-    if response.url().as_str() != account.secondary_auth_endpoint("") {
+    if response.url().as_str() != account.secondary_auth_endpoint("")? {
         return Err(Error::UnexpectedResponse("secondary-auth-origin-changed".into()));
     }
     report_session_headers("sms-bootstrap", response.headers());
@@ -353,10 +604,41 @@ async fn select_server_sms_route(account: &mut AppleAccount<ProbeProvider>) -> R
     let bytes = response.bytes().await?;
     if bytes.len() > 65536 { return Err(Error::Parse); }
     let bag: Dictionary = plist::from_bytes(&bytes)?;
-    account.secondary_auth_origin = secondary_origin_from_bag(&bag)?;
+    let secondary = secondary_origin_from_bag(&bag)?;
+    // Historical SMS-only discriminator. Explicitly not the production route:
+    // it keeps SRP on GSA while varying secondary auth, as recorded in evidence.
+    account.auth_routes_override = Some(AuthRoutes {
+        srp: GSA_ENDPOINT,
+        secondary: if secondary == "https://gsd.apple.com" { "https://gsd.apple.com/auth" } else { "https://gsa.apple.com/auth" },
+        trusted_device: "https://gsa.apple.com/auth/verify/trusteddevice",
+        validate_code: "https://gsa.apple.com/grandslam/GsService2/validate",
+    });
     println!("probe_secondary_auth_route={}",
-        if account.secondary_auth_origin == "https://gsd.apple.com" { "gsd" } else { "gsa" });
+        if secondary == "https://gsd.apple.com" { "gsd" } else { "gsa" });
     Ok(())
+}
+
+fn coherent_auth_routes(bag: &Dictionary) -> Result<(&'static str, &'static str), Error> {
+    let srp = srp_endpoint_from_bag(bag)?;
+    let secondary = secondary_origin_from_bag(bag)?;
+    if !srp.starts_with(&format!("{secondary}/")) {
+        return Err(Error::UnexpectedResponse("inconsistent-auth-services".into()));
+    }
+    Ok((srp, secondary))
+}
+
+#[test]
+fn server_auth_routes_require_complete_coherent_official_pair() {
+    let bag_for = |srp: &str, sms: &str| Dictionary::from_iter([("urls", Value::Dictionary(
+        Dictionary::from_iter([("gsService", Value::String(srp.into())),
+            ("secondaryAuth", Value::String(sms.into()))]))) ]);
+    for origin in ["https://gsa.apple.com", "https://gsd.apple.com"] {
+        let bag = bag_for(&format!("{origin}/grandslam/GsService2"), &format!("{origin}/auth"));
+        assert_eq!(coherent_auth_routes(&bag).unwrap().1, origin);
+    }
+    assert!(coherent_auth_routes(&bag_for(GSA_ENDPOINT, "https://gsd.apple.com/auth")).is_err());
+    assert!(coherent_auth_routes(&bag_for(GSA_ENDPOINT, "https://private.invalid/auth")).is_err());
+    assert!(coherent_auth_routes(&Dictionary::new()).is_err());
 }
 
 #[test]
@@ -422,18 +704,44 @@ fn sms_challenge(extras: Result<AuthenticationExtras, Error>) -> Result<SmsChall
     }
 }
 
+fn manual_device_code_required(state: &LoginState) -> Result<bool, Error> {
+    match state {
+        LoginState::NeedsDevice2FA | LoginState::Needs2FAVerification => Ok(true),
+        LoginState::LoggedIn => Ok(false),
+        _ => Err(Error::UnexpectedResponse("manual-device-verification-not-offered".into())),
+    }
+}
+
+async fn read_verification_code() -> Result<String, Error> {
+    let raw = tokio::task::spawn_blocking(|| read_private_line(256)).await.map_err(|_| Error::Parse)?;
+    let code: String = serde_json::from_slice(&raw)?;
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) { return Err(Error::Parse); }
+    Ok(code)
+}
+
 async fn password_sms_probe(input: PasswordProbeInput) -> Result<(), Error> {
     if input.output_protocol != "private-pipe-sealed-v1" { return Err(Error::Parse); }
     if input.sms_bootstrap_only && input.sms_session_replay { return Err(Error::Parse); }
+    let manual_device_code = input.verification_channel == ProbeVerificationChannel::ManualDeviceCode;
+    if manual_device_code && (!input.server_selected_auth || input.server_selected_sms
+        || input.sms_bootstrap_only || input.sms_session_replay) { return Err(Error::Parse); }
     let username = input.context.username.clone();
     let password = base64::decode(input.password_sha256).map_err(|_| Error::Parse)?;
     if password.len() != 32 { return Err(Error::Parse); }
     let mut account = bounded_auth(prepared_account(input.context)).await?;
-    if input.server_selected_sms {
+    if input.server_selected_auth {
+        if input.server_selected_sms { return Err(Error::Parse); }
+        // The production login now resolves and binds its own routes. Do not
+        // substitute a cfg(test) implementation for the claimed live path.
+    } else if input.server_selected_sms {
         bounded_auth(select_server_sms_route(&mut account)).await?;
     }
     println!("probe_password_attempt=1");
     let state = bounded_auth(account.login_email_pass(&username, &password)).await?;
+    if input.server_selected_auth {
+        println!("probe_server_auth_routes={}", if account.session_auth_routes()?.secondary
+            == "https://gsd.apple.com/auth" { "gsd" } else { "gsa" });
+    }
     print_state(&state);
     if input.sms_bootstrap_only {
         if matches!(state, LoginState::NeedsDevice2FA | LoginState::NeedsSMS2FA | LoginState::Needs2FAVerification) {
@@ -457,7 +765,7 @@ async fn password_sms_probe(input: PasswordProbeInput) -> Result<(), Error> {
         println!("probe_session_replay=true");
         account.secondary_auth_session = Some(Mutex::new(session));
     }
-    let state = match state {
+    let state = if manual_device_code { state } else { match state {
         LoginState::NeedsDevice2FA | LoginState::NeedsSMS2FA | LoginState::Needs2FAVerification => {
             // Use the actual trusted-phone list. Never invent or change a number.
             match sms_challenge(bounded_auth(account.get_auth_extras()).await)? {
@@ -473,16 +781,21 @@ async fn password_sms_probe(input: PasswordProbeInput) -> Result<(), Error> {
             }
         }
         state => state,
-    };
-    let code_was_required = matches!(state, LoginState::NeedsSMS2FAVerification(_));
-    let state = if let LoginState::NeedsSMS2FAVerification(body) = state {
+    }};
+    let manual_code_required = manual_device_code && manual_device_code_required(&state)?;
+    let code_was_required = manual_code_required || matches!(state, LoginState::NeedsSMS2FAVerification(_));
+    let state = if manual_code_required {
+        // Explicit operator-selected channel, never a fallback from SMS.
+        // The user generates the code on a real trusted Apple device. Do not
+        // trigger a popup, guess a code, or dispatch SMS from this branch.
+        println!("probe_manual_device_code_ready=true");
+        let _ = io::stdout().flush();
+        bounded_auth(account.verify_2fa(read_verification_code().await?)).await?
+    } else if let LoginState::NeedsSMS2FAVerification(body) = state {
         println!("probe_sms_requested=true");
         let _ = io::stdout().flush();
         // Only the private controlling wrapper can provide this framed input.
-        let raw = tokio::task::spawn_blocking(|| read_private_line(256)).await.map_err(|_| Error::Parse)?;
-        let code: String = serde_json::from_slice(&raw)?;
-        if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) { return Err(Error::Parse); }
-        bounded_auth(account.verify_sms_2fa(code, body)).await?
+        bounded_auth(account.verify_sms_2fa(read_verification_code().await?, body)).await?
     } else { state };
     print_state(&state);
     let state = if code_was_required {
@@ -534,6 +847,20 @@ fn sms_setup_failure_never_becomes_a_trusted_device_challenge() {
     assert!(matches!(sms_challenge(Err(Error::FailedGetting2FAConfig)), Err(Error::FailedGetting2FAConfig)));
     let extras = synthetic_sms_extras(&[7], Some(LoginState::Needs2FAVerification));
     assert!(matches!(sms_challenge(Ok(extras)), Err(Error::UnexpectedResponse(_))));
+}
+
+#[test]
+fn manual_device_channel_requires_explicit_selection_and_matching_challenge() {
+    assert!(matches!(ProbeVerificationChannel::default(), ProbeVerificationChannel::Sms));
+    assert!(matches!(serde_json::from_str::<ProbeVerificationChannel>("\"manual_device_code\"").unwrap(),
+        ProbeVerificationChannel::ManualDeviceCode));
+    assert!(serde_json::from_str::<ProbeVerificationChannel>("\"auto\"").is_err());
+    assert!(manual_device_code_required(&LoginState::NeedsDevice2FA).unwrap());
+    assert!(manual_device_code_required(&LoginState::Needs2FAVerification).unwrap());
+    assert!(!manual_device_code_required(&LoginState::LoggedIn).unwrap());
+    for state in [LoginState::NeedsSMS2FA, LoginState::NeedsLogin, LoginState::NeedsExtraStep("fixture".into())] {
+        assert!(manual_device_code_required(&state).is_err());
+    }
 }
 
 #[test]
@@ -658,7 +985,7 @@ async fn bounded_auth<T>(operation: impl std::future::Future<Output = Result<T, 
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "manual authorized password and one SMS; use only private sealing wrapper"]
+#[ignore = "manual authorized password and explicit verification channel; private sealing wrapper only"]
 async fn retained_profile_password_sms() {
     let raw = read_private_line(65536);
     let input: PasswordProbeInput = serde_json::from_slice(&raw).expect("invalid private schema");
