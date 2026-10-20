@@ -145,6 +145,10 @@ fn status(code: i64, hsc: i64) -> Value {
 }
 
 fn server(bad_proof: bool) -> Server {
+    server_with_verification(bad_proof, None)
+}
+
+fn server_with_verification(bad_proof: bool, verification: Option<(u16, i64, bool)>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -265,6 +269,10 @@ fn server(bad_proof: bool) -> Server {
                     "/selected-secondary" => (403, vec![]),
                     "/selected-secondary/verify/phone" | "/selected-trusted" => (200, vec![]),
                     "/selected-secondary/verify/phone/securitycode" => (401, vec![]),
+                    "/independent-validate" if verification.is_some() => {
+                        let (status, code, _) = verification.unwrap();
+                        (status, plist_bytes(&Dictionary::from_iter([("ec", Value::Integer(code.into()))])))
+                    },
                     "/independent-validate" => (
                         200,
                         plist_bytes(&Dictionary::from_iter([(
@@ -275,7 +283,11 @@ fn server(bad_proof: bool) -> Server {
                     _ => panic!("unexpected synthetic route"),
                 }
             };
-            write!(stream, "HTTP/1.1 {http_status} Fixture\r\nContent-Type: text/x-xml-plist\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            let token_header = if request.path == "/independent-validate"
+                && verification.is_some_and(|(_, _, include_pet)| include_pet) {
+                format!("X-Apple-PE-Token: {}\r\n", base64::encode("synthetic-account:fresh-verified-pet:300"))
+            } else { String::new() };
+            write!(stream, "HTTP/1.1 {http_status} Fixture\r\nContent-Type: text/x-xml-plist\r\nContent-Length: {}\r\n{token_header}Connection: close\r\n\r\n", body.len()).unwrap();
             stream.write_all(&body).unwrap();
         }
     });
@@ -284,6 +296,55 @@ fn server(bad_proof: bool) -> Server {
         requests,
         stop,
         handle: Some(handle),
+    }
+}
+
+#[tokio::test]
+async fn trusted_device_http_errors_never_accept_success_shaped_tokens() {
+    for status in [401, 429, 503] {
+        let server = server_with_verification(false, Some((status, 0, true)));
+        let mut account = account();
+        account.auth_routes_override = Some(server.routes);
+        account.login_email_pass(USER, &Sha256::digest(PASSWORD)).await.unwrap();
+        account.tokens.insert("com.apple.gs.idms.pet".into(), FetchedToken {
+            token: "pre-verification-token".into(), expiration: SystemTime::now() + Duration::from_secs(300),
+        });
+        assert!(account.verify_2fa("123456".into()).await.is_err());
+        assert_eq!(account.get_pet().as_deref(), Some("pre-verification-token"));
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn trusted_device_rejection_never_accepts_a_token_header() {
+    let server = server_with_verification(false, Some((200, -21669, true)));
+    let mut account = account();
+    account.auth_routes_override = Some(server.routes);
+    account.login_email_pass(USER, &Sha256::digest(PASSWORD)).await.unwrap();
+    assert!(account.verify_2fa("123456".into()).await.is_err());
+    assert_ne!(account.get_pet().as_deref(), Some("fresh-verified-pet"));
+}
+
+#[tokio::test]
+async fn trusted_device_success_requires_this_response_to_supply_the_pet() {
+    for include_pet in [false, true] {
+        let server = server_with_verification(false, Some((200, 0, include_pet)));
+        let mut account = account();
+        account.auth_routes_override = Some(server.routes);
+        account.login_email_pass(USER, &Sha256::digest(PASSWORD)).await.unwrap();
+        account.tokens.insert("com.apple.gs.idms.pet".into(), FetchedToken {
+            token: "pre-verification-token".into(), expiration: SystemTime::now() + Duration::from_secs(300),
+        });
+        let state = account.verify_2fa("123456".into()).await.unwrap();
+        if include_pet {
+            assert!(matches!(state, LoginState::LoggedIn));
+            assert_eq!(account.get_pet().as_deref(), Some("fresh-verified-pet"));
+            assert!(account.pet_remaining_lifetime().unwrap() > Duration::from_secs(290));
+        } else {
+            assert!(matches!(state, LoginState::NeedsLogin));
+            assert!(account.get_pet().is_none());
+        }
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
     }
 }
 

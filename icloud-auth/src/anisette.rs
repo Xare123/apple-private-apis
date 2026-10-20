@@ -202,6 +202,7 @@ mod provider_client_info_tests {
             Ok(HashMap::from_iter([
                 ("X-Apple-I-MD".into(), "synthetic-proof".into()),
                 ("X-Mme-Device-Id".into(), "synthetic-provider-id".into()),
+                ("X-Mme-Client-Info".into(), "synthetic-activation-client".into()),
             ]))
         }
         fn auth_client_info(&self) -> Option<&AnisetteClientInfo> { self.metadata.as_ref() }
@@ -235,6 +236,8 @@ mod provider_client_info_tests {
             assert_eq!(data.get_gsservice_headers()["X-MMe-Client-Info"], "synthetic-android-auth");
             assert_eq!(data.get_gsservice_headers()["User-Agent"], "synthetic-provider-agent");
             assert_eq!(data.get_extra_headers()["X-MMe-Client-Info"], "synthetic-android-auth");
+            assert_eq!(data.get_postdata_headers()["X-MMe-Client-Info"], "synthetic-android-auth");
+            assert_eq!(data.base_headers["X-Mme-Client-Info"], "synthetic-activation-client");
             assert_eq!(data.get_gsservice_headers()["X-Apple-I-MD"], "synthetic-proof");
             let cpd = data.get_cpd_data("synthetic-request");
             assert_eq!(cpd["X-Apple-I-SRL-NO"].as_string(), Some("synthetic-serial"));

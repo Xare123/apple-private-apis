@@ -387,6 +387,8 @@ fn error_kind(error: &AnisetteError) -> &'static str {
         AnisetteError::Misc => "misc_error",
         AnisetteError::MissingLibraries => "missing_libraries",
         AnisetteError::InvalidClientMetadata => "invalid_client_metadata",
+        AnisetteError::NativeRelayUnavailable(_) => "native_relay_unavailable",
+        AnisetteError::NativeRelayHttp(_) => "native_relay_http",
         #[cfg(feature = "remote-clearadi")]
         AnisetteError::ClearADIError(_) => "clearadi_error",
         AnisetteError::Anyhow(_) => "internal_error",
@@ -907,6 +909,16 @@ impl RemoteAnisetteProviderV3 {
             auth_client_info: None,
         }
     }
+
+    fn application_headers(&self, data: &AnisetteData) -> HashMap<String, String> {
+        let mut headers = data.get_headers();
+        // Generic callers (including iCloud delegates) retain their original
+        // application context. GSA/postdata obtain the ADI implementation's
+        // descriptor separately through auth_client_info(). Otherwise correcting
+        // AuthKit metadata also silently changes every downstream request.
+        headers.insert("X-Mme-Client-Info".into(), self.info.mme_client_info.clone());
+        headers
+    }
 }
 
 impl AnisetteProvider for RemoteAnisetteProviderV3 {
@@ -964,13 +976,51 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
                 }
             }
         };
-        Ok(data.get_headers())
+        Ok(self.application_headers(&data))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_headers_keep_client_context_separate_from_auth_metadata() {
+        let info = LoginClientInfo {
+            mme_client_info: "synthetic-activation-client".into(),
+            ..Default::default()
+        };
+        let mut provider = RemoteAnisetteProviderV3::new(
+            "https://example.invalid".into(), info, PathBuf::from("unused-fixture"));
+        provider.auth_client_info = Some(AnisetteClientInfo {
+            client_info: "synthetic-android-auth".into(),
+            user_agent: "synthetic-provider-agent".into(),
+        });
+        let data = AnisetteData {
+            machine_id: "synthetic-machine-proof".into(),
+            one_time_password: "synthetic-onetime-proof".into(),
+            routing_info: "synthetic-routing".into(),
+            device_description: "synthetic-android-auth".into(),
+            local_user_id: "synthetic-local-id".into(),
+            device_unique_identifier: "synthetic-device-id".into(),
+        };
+        let headers = provider.application_headers(&data);
+        assert_eq!(headers["X-Mme-Client-Info"], "synthetic-activation-client");
+        for (key, value) in [
+            ("X-Apple-I-MD", "synthetic-onetime-proof"),
+            ("X-Apple-I-MD-M", "synthetic-machine-proof"),
+            ("X-Apple-I-MD-RINFO", "synthetic-routing"),
+            ("X-Apple-I-MD-LU", "synthetic-local-id"),
+            ("X-Mme-Device-Id", "synthetic-device-id"),
+        ] {
+            assert_eq!(headers[key], value);
+        }
+        assert_eq!(headers.len(), 9);
+        // The provider's GSA metadata and its original proof are not rewritten.
+        assert_eq!(provider.auth_client_info().unwrap().client_info, "synthetic-android-auth");
+        assert_eq!(data.device_description, "synthetic-android-auth");
+
+    }
 
     fn metadata_fixture(client_info: &str, user_agent: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"client_info":client_info,"user_agent":user_agent})).unwrap()

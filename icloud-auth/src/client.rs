@@ -129,6 +129,23 @@ pub struct FetchedToken {
     expiration: SystemTime,
 }
 
+fn remaining_token_lifetime(expiration: SystemTime, now: SystemTime) -> Duration {
+    expiration.duration_since(now).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod token_lifetime_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn lifetime_is_observed_without_extending_expired_tokens() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        assert_eq!(remaining_token_lifetime(now + Duration::from_secs(20), now), Duration::from_secs(20));
+        assert_eq!(remaining_token_lifetime(now, now), Duration::ZERO);
+        assert_eq!(remaining_token_lifetime(now - Duration::from_secs(20), now), Duration::ZERO);
+    }
+}
+
 pub struct AppleAccount<T: AnisetteProvider> {
     //TODO: move this to omnisette
     pub anisette: ArcAnisetteClient<T>,
@@ -629,6 +646,12 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
     pub fn get_pet(&self) -> Option<String> {
         self.tokens.get("com.apple.gs.idms.pet").map(|t| &t.token).cloned()
+    }
+
+    /// Non-secret diagnostic only. Does not refresh or extend the token.
+    pub fn pet_remaining_lifetime(&self) -> Option<Duration> {
+        self.tokens.get("com.apple.gs.idms.pet")
+            .map(|token| remaining_token_lifetime(token.expiration, SystemTime::now()))
     }
 
     pub fn get_name(&self) -> (String, String) {
@@ -1156,6 +1179,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .headers(headers.await?)
             .send().await?;
 
+        debug!("Apple authentication HTTP: stage=trusted-device-push; status={}", res.status().as_u16());
         if !res.status().is_success() {
             let status = res.status();
             error!("send_2fa_to_devices failed: HTTP {}", status);
@@ -1275,6 +1299,20 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                 HeaderValue::from_str(&code).unwrap(),
             )
             .send().await?;
+
+        // A success-shaped body/token on an HTTP error cannot authenticate.
+        // Check before parsing or replacing any of the account's token state.
+        let status = res.status();
+        debug!("Apple authentication HTTP: stage=trusted-device-verification; status={}", status.as_u16());
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(Error::AuthenticationRateLimited);
+        }
+        if status.is_server_error() {
+            return Err(Error::AuthenticationServiceUnavailable(status.as_u16()));
+        }
+        if !status.is_success() {
+            return Err(Error::AuthSrp);
+        }
 
         let headers = res.headers().clone();
 
